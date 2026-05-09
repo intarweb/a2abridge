@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -45,8 +46,12 @@ func TestHookScriptStartsWithShebang(t *testing.T) {
 
 // TestCopyTreeMarksShellExecutable verifies that when CopyTree extracts
 // a .sh file, the result is mode 0755 — otherwise the UserPromptSubmit
-// hook would land non-executable on the user's disk.
+// hook would land non-executable on the user's disk. Windows doesn't
+// honour POSIX exec bits on regular files, so this test is POSIX-only.
 func TestCopyTreeMarksShellExecutable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX exec bit not applicable on Windows")
+	}
 	dst := t.TempDir()
 	src, err := SkillFS()
 	if err != nil {

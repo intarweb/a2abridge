@@ -7,10 +7,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,14 +21,39 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/vbcherepanov/a2abridge/internal/a2a"
+	"github.com/vbcherepanov/a2abridge/internal/metrics"
 	"github.com/vbcherepanov/a2abridge/internal/security"
 )
+
+// directoryRequestTimeout bounds every directory HTTP call (register,
+// heartbeat, /agents listing) and each peer agent-card fetch.
+const directoryRequestTimeout = 5 * time.Second
 
 // MCPDeps ties the local store, own card and directory URL so MCP tools can act.
 type MCPDeps struct {
 	Store        *Store
 	OwnCard      a2a.AgentCard
-	DirectoryURL string // e.g. http://127.0.0.1:7777
+	DirectoryURL string       // e.g. http://127.0.0.1:7777
+	Log          *slog.Logger // optional; nil falls back to slog.Default()
+}
+
+func (d *MCPDeps) logger() *slog.Logger {
+	if d.Log != nil {
+		return d.Log
+	}
+	return slog.Default()
+}
+
+// screenOutbound applies the PII / secret screen to text that is about to
+// leave this agent. Every outbound path (send_message, send_streaming,
+// complete_task) MUST go through this single choke point so a new tool
+// can't silently bypass the screen.
+func screenOutbound(text string, log *slog.Logger) (string, []security.Match) {
+	redacted, hits := security.Screen(text)
+	if len(hits) > 0 {
+		log.Warn("outbound text redacted", "summary", security.FormatMatches(hits), "count", len(hits))
+	}
+	return redacted, hits
 }
 
 // RegisterTools attaches a2a_* MCP tools that use the A2A protocol as transport.
@@ -75,7 +103,7 @@ func RegisterTools(s *server.MCPServer, d *MCPDeps) {
 			// the message still goes through with usable context — only
 			// the secret is stripped. The MCP tool result mentions any
 			// redaction so the model can warn the user.
-			redacted, hits := security.Screen(text)
+			redacted, hits := screenOutbound(text, d.logger())
 			text = redacted
 
 			client := a2a.NewClient(peerURL)
@@ -102,6 +130,7 @@ func RegisterTools(s *server.MCPServer, d *MCPDeps) {
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
+			metrics.IncMessagesSent()
 			// Регистрируем исходящую задачу для фонового опроса — чтобы
 			// когда пир ответит, ответ автоматически попал в inbox и hook
 			// подсунул его пользователю в следующий turn.
@@ -137,13 +166,22 @@ func RegisterTools(s *server.MCPServer, d *MCPDeps) {
 				timeout = time.Duration(v * float64(time.Second))
 			}
 
+			// Same secret screen as a2a_send_message — streaming must not
+			// be a side door for unredacted text.
+			redacted, hits := screenOutbound(text, d.logger())
+			text = redacted
+			meta := map[string]any{"from": d.OwnCard.Name, "fromUrl": d.OwnCard.URL}
+			if len(hits) > 0 {
+				meta["redactions"] = security.FormatMatches(hits)
+			}
+
 			client := a2a.NewClient(peerURL)
 			params := a2a.MessageSendParams{
 				Message: a2a.Message{
 					MessageID: uuid.NewString(),
 					Role:      a2a.RoleUser,
 					Parts:     []a2a.Part{{Text: text}},
-					Metadata:  map[string]any{"from": d.OwnCard.Name, "fromUrl": d.OwnCard.URL},
+					Metadata:  meta,
 				},
 			}
 
@@ -157,9 +195,20 @@ func RegisterTools(s *server.MCPServer, d *MCPDeps) {
 			for ev := range ch {
 				collected = append(collected, ev)
 			}
-			if err := <-errCh; err != nil && err != context.Canceled {
+			if err := <-errCh; err != nil && !errors.Is(err, context.Canceled) {
+				if errors.Is(err, context.DeadlineExceeded) {
+					// The peer accepted the message and is still working —
+					// don't discard what we already streamed; surface it
+					// with an explicit note.
+					metrics.IncMessagesSent()
+					b, _ := json.MarshalIndent(collected, "", "  ")
+					return mcp.NewToolResultText(fmt.Sprintf(
+						"note: timed out after %s before the task reached a terminal state; events collected so far:\n%s",
+						timeout, b)), nil
+				}
 				return mcp.NewToolResultError(err.Error()), nil
 			}
+			metrics.IncMessagesSent()
 			b, _ := json.MarshalIndent(collected, "", "  ")
 			return mcp.NewToolResultText(string(b)), nil
 		},
@@ -231,8 +280,15 @@ func RegisterTools(s *server.MCPServer, d *MCPDeps) {
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			taskID, _ := req.RequireString("task_id")
 			text, _ := req.RequireString("text")
-			if err := d.Store.CompleteTask(taskID, text); err != nil {
+			// The reply leaves this agent via SSE / push webhooks, so it
+			// goes through the same secret screen as direct sends.
+			redacted, hits := screenOutbound(text, d.logger())
+			if err := d.Store.CompleteTask(taskID, redacted); err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
+			}
+			metrics.IncMessagesSent()
+			if len(hits) > 0 {
+				return mcp.NewToolResultText("completed (" + security.FormatMatches(hits) + ")"), nil
 			}
 			return mcp.NewToolResultText("completed"), nil
 		},
@@ -250,7 +306,9 @@ func listPeers(ctx context.Context, directoryURL, selfURL string) ([]PeerInfo, e
 	if directoryURL == "" {
 		return nil, fmt.Errorf("A2A_DIRECTORY not set")
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(directoryURL, "/")+"/agents", nil)
+	dirCtx, cancel := context.WithTimeout(ctx, directoryRequestTimeout)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(dirCtx, http.MethodGet, strings.TrimRight(directoryURL, "/")+"/agents", http.NoBody)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -262,28 +320,49 @@ func listPeers(ctx context.Context, directoryURL, selfURL string) ([]PeerInfo, e
 	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
 		return nil, err
 	}
-	out := make([]PeerInfo, 0, len(entries))
+	peers := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if e.URL == selfURL {
 			continue
 		}
-		info := PeerInfo{URL: e.URL}
-		card, err := a2a.NewClient(e.URL).FetchAgentCard(ctx)
-		if err != nil {
-			info.Err = err.Error()
-		} else {
-			info.Card = card
-		}
-		out = append(out, info)
+		peers = append(peers, e.URL)
 	}
+	// Fetch agent cards concurrently with a bounded fan-out — sequential
+	// fetches make one hung peer stall the whole discovery call.
+	out := make([]PeerInfo, len(peers))
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for i, peerURL := range peers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			info := PeerInfo{URL: peerURL}
+			cardCtx, ccancel := context.WithTimeout(ctx, directoryRequestTimeout)
+			defer ccancel()
+			card, err := a2a.NewClient(peerURL).FetchAgentCard(cardCtx)
+			if err != nil {
+				info.Err = err.Error()
+			} else {
+				info.Card = card
+			}
+			out[i] = info
+		}()
+	}
+	wg.Wait()
 	return out, nil
 }
 
 // Heartbeat periodically re-registers this agent with the directory.
+// Every POST carries its own timeout so a wedged directory can't park
+// this goroutine on a response that never comes.
 func Heartbeat(ctx context.Context, directoryURL, selfURL string) {
 	body, _ := json.Marshal(map[string]string{"url": selfURL})
-	do := func(path string) {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+	do := func(reqCtx context.Context, path string, timeout time.Duration) {
+		rctx, cancel := context.WithTimeout(reqCtx, timeout)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(rctx, http.MethodPost,
 			strings.TrimRight(directoryURL, "/")+path, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
@@ -292,16 +371,19 @@ func Heartbeat(ctx context.Context, directoryURL, selfURL string) {
 			resp.Body.Close()
 		}
 	}
-	do("/register")
+	do(ctx, "/register", directoryRequestTimeout)
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			do("/unregister")
+			// The outer ctx is already canceled — a request built on it
+			// would abort instantly and the directory would keep listing a
+			// dead bridge for a full TTL. Use a short fresh context.
+			do(context.Background(), "/unregister", 2*time.Second)
 			return
 		case <-t.C:
-			do("/heartbeat")
+			do(ctx, "/heartbeat", directoryRequestTimeout)
 		}
 	}
 }
@@ -333,12 +415,12 @@ func subscribeOutgoingReply(peerURL, taskID string, store *Store) {
 		// Two paths reach a terminal: (a) statusUpdate with final=true and a
 		// terminal state, (b) a final 'task' message after the peer aggregated.
 		if ev.StatusUpdate != nil && ev.StatusUpdate.Final {
-			if isTerminalState(ev.StatusUpdate.Status.State) {
+			if isTerminal(ev.StatusUpdate.Status.State) {
 				terminal = true
 				break
 			}
 		}
-		if ev.Task != nil && isTerminalState(ev.Task.Status.State) {
+		if ev.Task != nil && isTerminal(ev.Task.Status.State) {
 			terminal = true
 			break
 		}
@@ -355,13 +437,4 @@ func subscribeOutgoingReply(peerURL, taskID string, store *Store) {
 		return
 	}
 	store.IngestOutgoingTerminal(t)
-}
-
-func isTerminalState(s a2a.TaskState) bool {
-	switch s {
-	case a2a.TaskStateCompleted, a2a.TaskStateFailed,
-		a2a.TaskStateCanceled, a2a.TaskStateRejected:
-		return true
-	}
-	return false
 }

@@ -5,7 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 )
+
+// newConfigMode is the permission set used when a config file is created
+// from scratch. Configs may hold tokens, so default to owner-only.
+const newConfigMode = 0o600
 
 // readJSONObject reads path as JSON (or JSON-with-comments) and returns
 // its top-level object. If the file is missing or empty, returns an empty
@@ -28,7 +33,11 @@ func readJSONObject(path string) (map[string]any, error) {
 	cleaned := stripJSONComments(b)
 	cleaned = stripTrailingCommas(cleaned)
 	var m map[string]any
-	if err := json.Unmarshal(cleaned, &m); err != nil {
+	// UseNumber keeps integers as json.Number instead of float64 — otherwise
+	// large IDs (> 2^53) in the user's config would be corrupted on rewrite.
+	dec := json.NewDecoder(bytes.NewReader(cleaned))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	if m == nil {
@@ -147,28 +156,109 @@ func stripTrailingCommas(in []byte) []byte {
 }
 
 // writeJSONObject writes obj to path as 2-space-indented JSON, with a final
-// newline. The caller is responsible for backing up the file first.
+// newline. The caller is responsible for backing up the file first. The
+// write is atomic and preserves the original file mode (see writeFileAtomic).
 func writeJSONObject(path string, obj map[string]any) error {
 	b, err := json.MarshalIndent(obj, "", "  ")
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
-	if err := os.MkdirAll(parentDir(path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, b, 0o644)
+	return writeFileAtomic(path, b, newConfigMode)
 }
 
-// parentDir is a tiny helper to keep the std-lib filepath import out of
-// the call sites that don't otherwise need it.
-func parentDir(p string) string {
-	for i := len(p) - 1; i >= 0; i-- {
-		if p[i] == '/' || p[i] == '\\' {
-			return p[:i]
-		}
+// writeFileAtomic writes data to path via a temp file in the same directory
+// plus rename, so readers never observe a truncated config. An existing
+// file's permissions are preserved; new files get defaultMode.
+func writeFileAtomic(path string, data []byte, defaultMode os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
 	}
-	return "."
+	mode := defaultMode
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+// writeJSONConfig is the shared body of every JSON-based IDE writer:
+// resolve → read (JSONC-tolerant) → mutate → backup → atomic write. mutate
+// reports whether anything actually changed; an unchanged config is
+// reported as Skipped and never rewritten (idempotency).
+func writeJSONConfig(name, path string, dryRun bool, mutate func(root map[string]any) bool) Result {
+	res := Result{IDE: name, DryRun: dryRun}
+	if path == "" {
+		res.Error = fmt.Errorf("could not resolve %s config path", name)
+		return res
+	}
+	res.Path = path
+	res.Found = fileExists(path)
+
+	root, err := readJSONObject(path)
+	if err != nil {
+		res.Error = err
+		return res
+	}
+	if !mutate(root) {
+		res.Skipped = true
+		return res
+	}
+	if dryRun {
+		res.Updated = true
+		return res
+	}
+	if res.Found {
+		bak, berr := backupFile(path)
+		if berr != nil {
+			res.Error = fmt.Errorf("backup: %w", berr)
+			return res
+		}
+		res.Backup = bak
+	}
+	if err := writeJSONObject(path, root); err != nil {
+		res.Error = err
+		return res
+	}
+	res.Updated = true
+	return res
+}
+
+// setMCPServerEntry installs the desired mcpServers.<key> block into root.
+// Returns false when the entry is already up to date.
+func setMCPServerEntry(root map[string]any, spec Spec) bool {
+	servers := ensureNestedMap(root, "mcpServers")
+	desired := mcpEntryJSON(spec)
+	if equalJSON(servers[spec.Key], desired) {
+		return false
+	}
+	servers[spec.Key] = desired
+	return true
 }
 
 // ensureNestedMap walks/creates nested maps along keys, returning the leaf
@@ -198,5 +288,5 @@ func equalJSON(a, b any) bool {
 	if err1 != nil || err2 != nil {
 		return false
 	}
-	return string(ab) == string(bb)
+	return bytes.Equal(ab, bb)
 }

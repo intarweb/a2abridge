@@ -2,105 +2,86 @@ package ideconfig
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
-	"runtime"
 )
 
-// claudeCodeWriter handles Claude Code's MCP block.
+// claudeCodeWriter handles Claude Code's MCP block and UserPromptSubmit hook.
 //
-// Claude Code stores user-level MCP servers in one of two files; we look at
-// both and prefer the one that already exists. Both have the same schema:
+// Claude Code reads user-scope mcpServers from ~/.claude.json (verified on a
+// live install — ~/.claude/settings.json does NOT pick up mcpServers; it's an
+// undocumented key there), while hooks live in ~/.claude/settings.json. The
+// writer therefore touches two files, each with its own timestamped backup:
 //
-//	{
-//	  "mcpServers": {
-//	    "a2a": { "command": "...", "args": ["bridge"], "env": {...} }
-//	  }
-//	}
+//	~/.claude.json           — "mcpServers": { "a2a": { ... } }
+//	~/.claude/settings.json  — "hooks": { "UserPromptSubmit": [ ... ] }
+//
+// Both writes are idempotent: an up-to-date file is never rewritten.
 type claudeCodeWriter struct{}
 
 func (claudeCodeWriter) Name() string { return "Claude Code" }
 
+// claudeMCPConfigPath is the file Claude Code actually reads user-scope MCP
+// servers from. Empty string only when the home dir cannot be resolved.
+func claudeMCPConfigPath() string {
+	h, err := homeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(h, ".claude.json")
+}
+
+// claudeSettingsPath hosts hooks (and legacy mcpServers entries written by
+// older a2abridge versions, cleaned up on uninstall).
+func claudeSettingsPath() string {
+	h, err := homeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(h, ".claude", "settings.json")
+}
+
 func (claudeCodeWriter) Detect() string {
-	for _, p := range claudeCodeCandidatePaths() {
-		if fileExists(p) {
-			return p
+	if p := claudeMCPConfigPath(); fileExists(p) {
+		return p
+	}
+	if p := claudeSettingsPath(); fileExists(p) {
+		return p
+	}
+	// A bare ~/.claude directory is enough evidence Claude Code is installed.
+	if h, err := homeDir(); err == nil {
+		if d := filepath.Join(h, ".claude"); dirExists(d) {
+			return d
 		}
 	}
-	// Default to ~/.claude/settings.json — installer will create it.
-	if h, err := homeDir(); err == nil {
-		return filepath.Join(h, ".claude", "settings.json")
-	}
-	return ""
+	// Default write target — installer will create it as a fresh {} object.
+	return claudeMCPConfigPath()
 }
 
 func (w claudeCodeWriter) Write(spec Spec, dryRun bool) Result {
-	res := Result{IDE: w.Name(), DryRun: dryRun}
-	path := w.Detect()
-	if path == "" {
-		res.Error = fmt.Errorf("could not resolve Claude Code config path")
-		return res
-	}
-	res.Path = path
-	res.Found = fileExists(path)
-
-	root, err := readJSONObject(path)
-	if err != nil {
-		res.Error = err
+	res := writeJSONConfig(w.Name(), claudeMCPConfigPath(), dryRun, func(root map[string]any) bool {
+		return setMCPServerEntry(root, spec)
+	})
+	if res.Error != nil || spec.HookCommand == "" {
 		return res
 	}
 
-	servers := ensureNestedMap(root, "mcpServers")
-	desired := mcpEntryJSON(spec)
-	mcpUpToDate := equalJSON(servers[spec.Key], desired)
-	hookUpToDate := !needsHookUpdate(root, spec)
-	if mcpUpToDate && hookUpToDate {
-		res.Skipped = true
-		return res
-	}
-	servers[spec.Key] = desired
-	if spec.HookCommand != "" {
-		mergeUserPromptSubmitHook(root, spec.HookCommand)
-	}
-
-	if dryRun {
-		res.Updated = true
-		return res
-	}
-
-	if res.Found {
-		bak, berr := backupFile(path)
-		if berr != nil {
-			res.Error = fmt.Errorf("backup: %w", berr)
-			return res
+	// Second transaction: the UserPromptSubmit hook goes into settings.json.
+	hookRes := writeJSONConfig(w.Name(), claudeSettingsPath(), dryRun, func(root map[string]any) bool {
+		if !needsHookUpdate(root, spec) {
+			return false
 		}
-		res.Backup = bak
-	}
-	if err := writeJSONObject(path, root); err != nil {
-		res.Error = err
+		mergeUserPromptSubmitHook(root, spec.HookCommand)
+		return true
+	})
+	if hookRes.Error != nil {
+		res.Error = fmt.Errorf("hook merge in %s: %w", hookRes.Path, hookRes.Error)
 		return res
 	}
-	res.Updated = true
+	if hookRes.Updated {
+		res.Updated = true
+		res.Skipped = false
+	}
 	return res
-}
-
-// claudeCodeCandidatePaths returns the list of locations Claude Code may
-// read from, in priority order.
-func claudeCodeCandidatePaths() []string {
-	h, err := homeDir()
-	if err != nil {
-		return nil
-	}
-	paths := []string{
-		filepath.Join(h, ".claude", "settings.json"),
-		filepath.Join(h, ".claude.json"),
-	}
-	// Windows often duplicates under %USERPROFILE%, but UserHomeDir already
-	// returns it on Windows — keep one code path.
-	if runtime.GOOS == "windows" {
-		_ = os.Getenv // keep the import live (Windows-only branches expand later)
-	}
-	return paths
 }
 
 // mcpEntryJSON renders the MCP server block in the format every JSON-based

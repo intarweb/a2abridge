@@ -113,11 +113,19 @@ func Browse(ctx context.Context, timeout time.Duration) ([]string, error) {
 // urlFromEntry extracts the canonical URL from a ServiceEntry. We prefer
 // the "url=" TXT field; if it's missing (e.g. a peer published with a
 // different stack), we fall back to assembling http://<hostname>:<port>.
+// TXT records are attacker-controlled LAN input, so the url= value is
+// only accepted when it parses as an absolute http(s) URL.
 func urlFromEntry(e *zeroconf.ServiceEntry) string {
 	for _, t := range e.Text {
-		if strings.HasPrefix(t, "url=") {
-			return strings.TrimPrefix(t, "url=")
+		raw, ok := strings.CutPrefix(t, "url=")
+		if !ok {
+			continue
 		}
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			continue // malformed or non-http(s) advertisement: skip
+		}
+		return raw
 	}
 	if e.HostName == "" || e.Port == 0 {
 		return ""

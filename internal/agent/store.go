@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -14,6 +15,15 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/vbcherepanov/a2abridge/internal/a2a"
+	"github.com/vbcherepanov/a2abridge/internal/metrics"
+)
+
+// Janitor knobs. Terminal tasks are kept around for a grace period so
+// late GetTask / resubscribe calls still resolve, then evicted to keep
+// the in-memory store bounded on long-lived bridges.
+const (
+	terminalTaskTTL = 30 * time.Minute
+	janitorInterval = time.Minute
 )
 
 // Store implements a2a.Handler for a local agent.
@@ -44,6 +54,21 @@ type Store struct {
 	// webhooks here; Store calls Notify on every task state change so
 	// subscribers without an open SSE stream still see updates.
 	Push *PushStore
+
+	// Log — optional structured logger for background failures (inbox
+	// persistence, janitor). nil falls back to slog.Default().
+	Log *slog.Logger
+
+	janitorStop chan struct{}
+	closeOnce   sync.Once
+}
+
+// logger returns the configured logger or the process default.
+func (s *Store) logger() *slog.Logger {
+	if s.Log != nil {
+		return s.Log
+	}
+	return slog.Default()
 }
 
 // CreatePushConfig / GetPushConfig / ListPushConfigs / DeletePushConfig:
@@ -74,12 +99,60 @@ type pendingOutgoingTask struct {
 }
 
 func NewStore() *Store {
-	return &Store{
+	s := &Store{
 		tasks:           map[string]*a2a.Task{},
 		subscribers:     map[string][]chan a2a.StreamResponse{},
 		pendingOutgoing: map[string]*pendingOutgoingTask{},
 		Push:            NewPushStore(),
+		janitorStop:     make(chan struct{}),
 	}
+	go s.janitor()
+	return s
+}
+
+// Close stops the background janitor. Safe to call multiple times.
+func (s *Store) Close() {
+	s.closeOnce.Do(func() { close(s.janitorStop) })
+}
+
+// janitor periodically evicts terminal tasks older than terminalTaskTTL.
+func (s *Store) janitor() {
+	t := time.NewTicker(janitorInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.janitorStop:
+			return
+		case <-t.C:
+			s.evictTerminal(time.Now())
+		}
+	}
+}
+
+// evictTerminal deletes tasks that reached a terminal state more than
+// terminalTaskTTL ago and cascades the delete to their push configs.
+// Non-terminal tasks are never evicted — they may still receive messages.
+// Returns the number of evicted tasks.
+func (s *Store) evictTerminal(now time.Time) int {
+	cutoff := now.Add(-terminalTaskTTL)
+	s.mu.Lock()
+	var evicted []string
+	for id, t := range s.tasks {
+		if isTerminal(t.Status.State) && !t.Status.Timestamp.IsZero() && t.Status.Timestamp.Before(cutoff) {
+			delete(s.tasks, id)
+			evicted = append(evicted, id)
+		}
+	}
+	s.mu.Unlock()
+	for _, id := range evicted {
+		// Empty PushConfigID = delete all webhooks for the task. The
+		// ErrTaskNotFound case (no configs registered) is expected.
+		_ = s.Push.DeletePushConfig(context.Background(), a2a.PushNotificationConfigParams{TaskID: id})
+	}
+	if len(evicted) > 0 {
+		s.logger().Info("evicted terminal tasks", "count", len(evicted), "ttl", terminalTaskTTL)
+	}
+	return len(evicted)
 }
 
 // TrackOutgoing registers a task initiated by this agent for background polling.
@@ -205,63 +278,43 @@ func (s *Store) PollOutgoing(fetcher func(peerURL, taskID string) (*a2a.Task, er
 		if err != nil {
 			continue
 		}
-		switch t.Status.State {
-		case a2a.TaskStateCompleted, a2a.TaskStateFailed, a2a.TaskStateCanceled, a2a.TaskStateRejected:
-			// извлечь ответ
-			reply := ""
-			for _, a := range t.Artifacts {
-				for _, pt := range a.Parts {
-					if pt.Text != "" {
-						if reply != "" {
-							reply += "\n"
-						}
-						reply += pt.Text
-					}
-				}
-			}
-			if reply == "" && t.Status.Message != nil {
-				for _, pt := range t.Status.Message.Parts {
-					if pt.Text != "" {
-						reply = pt.Text
-						break
-					}
-				}
-			}
-			s.mu.Lock()
-			delete(s.pendingOutgoing, p.TaskID)
-			synthetic := a2a.Message{
-				MessageID: "reply-" + p.TaskID,
-				TaskID:    p.TaskID,
-				Role:      a2a.RoleAgent,
-				Parts:     []a2a.Part{{Text: fmt.Sprintf("[ОТВЕТ от %s на твой вопрос «%s»]\n%s", p.PeerName, trimTo(p.Question, 80), reply)}},
-				Metadata:  map[string]any{"from": p.PeerName, "kind": "outgoing-reply", "state": string(t.Status.State)},
-			}
-			s.inbox = append(s.inbox, synthetic)
-			s.persistInboxLocked()
-			cb := s.OnIncoming
-			s.mu.Unlock()
-			// Trigger nudger so the sender's live Claude/Codex gets a turn
-			// to surface the reply — same path as for inbound messages.
-			if cb != nil {
-				go cb(synthetic)
-			}
-			completed++
+		if !isTerminal(t.Status.State) {
+			continue
 		}
+		// Re-check membership under the lock: the SSE fast path
+		// (IngestOutgoingTerminal) may have delivered this reply while we
+		// were doing the network fetch above. Mirroring its idempotency
+		// here prevents a double inbox entry.
+		s.mu.Lock()
+		if _, ok := s.pendingOutgoing[p.TaskID]; !ok {
+			s.mu.Unlock()
+			continue
+		}
+		delete(s.pendingOutgoing, p.TaskID)
+		s.mu.Unlock()
+		// Shared with the SSE path so OnIncoming and the
+		// on-outgoing-reply user hook fire on both.
+		s.appendSyntheticReply(p, extractReplyText(t), string(t.Status.State))
+		completed++
 	}
 	return completed
 }
 
+// trimTo shortens s to at most n runes (not bytes — slicing bytes could
+// split a multi-byte rune in half) and flattens newlines.
 func trimTo(s string, n int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(r[:n]) + "..."
 }
 
 // persistInboxLocked writes the current inbox to InboxPath atomically.
 // Must be called with s.mu held.
 func (s *Store) persistInboxLocked() {
+	metrics.SetInboxSize(len(s.inbox))
 	if s.InboxPath == "" {
 		return
 	}
@@ -294,9 +347,18 @@ func (s *Store) persistInboxLocked() {
 	if err != nil {
 		return
 	}
+	// 0600 — the snapshot carries full inter-agent message text; other
+	// local users have no business reading it.
 	tmp := s.InboxPath + ".tmp"
-	_ = os.WriteFile(tmp, b, 0644)
-	_ = os.Rename(tmp, s.InboxPath)
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		// Skip the rename: a stale tmp from a previous failure must not
+		// be promoted over the last good snapshot.
+		s.logger().Warn("inbox snapshot write failed", "path", tmp, "err", err)
+		return
+	}
+	if err := os.Rename(tmp, s.InboxPath); err != nil {
+		s.logger().Warn("inbox snapshot rename failed", "path", s.InboxPath, "err", err)
+	}
 }
 
 // --- a2a.Handler ---
@@ -315,6 +377,11 @@ func (s *Store) SendMessage(ctx context.Context, p a2a.MessageSendParams) (*a2a.
 	defer s.mu.Unlock()
 
 	task, existed := s.tasks[taskID]
+	if existed && isTerminal(task.Status.State) {
+		// A terminal task accepts no further input — appending would only
+		// grow history and re-notify subscribers with a stale final status.
+		return nil, nil, fmt.Errorf("task %s is in terminal state %s and accepts no further messages: %w", taskID, task.Status.State, a2a.ErrTaskNotCancelable)
+	}
 	if !existed {
 		task = &a2a.Task{
 			ID:        taskID,
@@ -336,6 +403,7 @@ func (s *Store) SendMessage(ctx context.Context, p a2a.MessageSendParams) (*a2a.
 	task.History = append(task.History, msg)
 	s.inbox = append(s.inbox, msg)
 	s.persistInboxLocked()
+	metrics.IncMessagesReceived()
 
 	if s.OnIncoming != nil {
 		go s.OnIncoming(msg)
@@ -396,6 +464,7 @@ func (s *Store) CancelTask(ctx context.Context, p a2a.TaskIDParams) (*a2a.Task, 
 		return nil, errors.New("task is in terminal state")
 	}
 	t.Status = a2a.TaskStatus{State: a2a.TaskStateCanceled, Timestamp: time.Now().UTC()}
+	metrics.IncTaskFailed()
 	s.notifyLocked(t.ID, a2a.StreamResponse{
 		StatusUpdate: &a2a.TaskStatusUpdateEvent{
 			TaskID: t.ID, ContextID: t.ContextID, Status: t.Status, Final: true,
@@ -424,13 +493,30 @@ func (s *Store) Subscribe(ctx context.Context, id string, out chan<- a2a.StreamR
 	}
 	// send current snapshot
 	snap := *t
+	if isTerminal(snap.Status.State) {
+		// No further events will ever arrive — deliver the snapshot and
+		// end the stream instead of parking a goroutine forever.
+		s.mu.Unlock()
+		select {
+		case out <- a2a.StreamResponse{Task: &snap}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return nil
+	}
 	ch := make(chan a2a.StreamResponse, 8)
 	s.subscribers[id] = append(s.subscribers[id], ch)
 	s.mu.Unlock()
 
-	out <- a2a.StreamResponse{Task: &snap}
-
 	defer s.removeSubscriber(id, ch)
+
+	// Every send to out is ctx-guarded: if the consumer stops reading we
+	// must not block forever and leak this goroutine.
+	select {
+	case out <- a2a.StreamResponse{Task: &snap}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	for {
 		select {
@@ -440,7 +526,11 @@ func (s *Store) Subscribe(ctx context.Context, id string, out chan<- a2a.StreamR
 			if !ok {
 				return nil
 			}
-			out <- ev
+			select {
+			case out <- ev:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 			if ev.StatusUpdate != nil && ev.StatusUpdate.Final {
 				return nil
 			}
@@ -515,6 +605,7 @@ func (s *Store) CompleteTask(taskID, replyText string) error {
 		Message:   &reply,
 		Timestamp: time.Now().UTC(),
 	}
+	metrics.IncTaskCompleted()
 	s.notifyLocked(t.ID, a2a.StreamResponse{
 		ArtifactUpdate: &a2a.TaskArtifactUpdateEvent{
 			TaskID: t.ID, ContextID: t.ContextID,
@@ -531,11 +622,37 @@ func (s *Store) CompleteTask(taskID, replyText string) error {
 }
 
 func (s *Store) notifyLocked(taskID string, ev a2a.StreamResponse) {
+	final := ev.StatusUpdate != nil && ev.StatusUpdate.Final
 	for _, ch := range s.subscribers[taskID] {
 		select {
 		case ch <- ev:
 		default:
+			// Buffer full. Intermediate events may be dropped under
+			// backpressure, but a terminal (Final) event must reach the
+			// subscriber: evict the oldest buffered event to make room.
+			// notifyLocked is the only sender and always runs under s.mu,
+			// so after the eviction the second send cannot fail.
+			if !final {
+				continue
+			}
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- ev:
+			default:
+			}
 		}
+	}
+	if final {
+		// The stream is over: close every subscriber channel so consumers
+		// drain what's buffered and exit, and drop the bookkeeping entry
+		// (removeSubscriber tolerates already-removed channels).
+		for _, ch := range s.subscribers[taskID] {
+			close(ch)
+		}
+		delete(s.subscribers, taskID)
 	}
 	// Webhook delivery is fire-and-forget so we can call it while holding
 	// the lock — Notify only takes its own short lock to copy the config

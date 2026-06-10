@@ -13,6 +13,10 @@ import (
 	"time"
 )
 
+// nonStreamingTimeout bounds unary RPC calls and agent-card fetches.
+// Streaming requests deliberately carry no client-side deadline.
+const nonStreamingTimeout = 60 * time.Second
+
 // Client is an A2A JSON-RPC 2.0 client.
 type Client struct {
 	BaseURL string // e.g. http://127.0.0.1:49152 or https://...
@@ -36,25 +40,53 @@ func NewClient(baseURL string) *Client {
 	return c
 }
 
-// FetchAgentCard GETs /.well-known/a2a.
-func (c *Client) FetchAgentCard(ctx context.Context) (*AgentCard, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+WellKnownPath, nil)
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, err
+// httpClient returns the configured *http.Client, falling back to
+// http.DefaultClient so a zero-value / struct-literal Client never panics.
+func (c *Client) httpClient() *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("agent card: %s", resp.Status)
-	}
-	var card AgentCard
-	if err := json.NewDecoder(resp.Body).Decode(&card); err != nil {
-		return nil, err
-	}
-	return &card, nil
+	return http.DefaultClient
 }
 
-func (c *Client) call(ctx context.Context, method string, params any, out any) error {
+// FetchAgentCard GETs /.well-known/agent-card.json, falling back to the
+// legacy /.well-known/a2a path when the peer predates A2A 1.0 paths.
+func (c *Client) FetchAgentCard(ctx context.Context) (*AgentCard, error) {
+	ctx, cancel := context.WithTimeout(ctx, nonStreamingTimeout)
+	defer cancel()
+	card, status, err := c.fetchCard(ctx, WellKnownPath)
+	if err == nil {
+		return card, nil
+	}
+	if status == http.StatusNotFound {
+		if legacy, _, lerr := c.fetchCard(ctx, WellKnownPathLegacy); lerr == nil {
+			return legacy, nil
+		}
+	}
+	return nil, err
+}
+
+func (c *Client) fetchCard(ctx context.Context, path string) (*AgentCard, int, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, http.NoBody)
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, resp.StatusCode, fmt.Errorf("agent card: %s", resp.Status)
+	}
+	var card AgentCard
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodySize)).Decode(&card); err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return &card, resp.StatusCode, nil
+}
+
+func (c *Client) call(ctx context.Context, method string, params, out any) error {
+	ctx, cancel := context.WithTimeout(ctx, nonStreamingTimeout)
+	defer cancel()
+
 	id, _ := json.Marshal(time.Now().UnixNano())
 	rawParams, _ := json.Marshal(params)
 	body, _ := json.Marshal(JSONRPCRequest{
@@ -64,11 +96,7 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("A2A-Version", ProtocolVersion)
 
-	httpClient := &http.Client{Timeout: 60 * time.Second}
-	if DefaultTransport != nil {
-		httpClient.Transport = DefaultTransport
-	}
-	resp, err := httpClient.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return err
 	}
@@ -78,7 +106,7 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 		JSONRPCResponse
 		Result json.RawMessage `json:"result"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodySize)).Decode(&r); err != nil {
 		return err
 	}
 	if r.Error != nil {
@@ -90,7 +118,7 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 	return nil
 }
 
-// SendMessage — a2a.SendMessage. Result is Task-or-Message union.
+// SendMessage — message/send. Result is Task-or-Message union.
 type SendMessageResult struct {
 	Task    *Task
 	Message *Message
@@ -100,6 +128,26 @@ func (c *Client) SendMessage(ctx context.Context, p MessageSendParams) (*SendMes
 	var raw json.RawMessage
 	if err := c.call(ctx, MethodSendMessage, p, &raw); err != nil {
 		return nil, err
+	}
+	// Dispatch on the spec "kind" discriminator when present; fall back to
+	// field-presence sniffing for legacy peers that don't emit it.
+	var probe struct {
+		Kind string `json:"kind"`
+	}
+	_ = json.Unmarshal(raw, &probe)
+	switch probe.Kind {
+	case "task":
+		var t Task
+		if err := json.Unmarshal(raw, &t); err != nil {
+			return nil, fmt.Errorf("SendMessage: decode task: %w", err)
+		}
+		return &SendMessageResult{Task: &t}, nil
+	case "message":
+		var m Message
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, fmt.Errorf("SendMessage: decode message: %w", err)
+		}
+		return &SendMessageResult{Message: &m}, nil
 	}
 	var t Task
 	if err := json.Unmarshal(raw, &t); err == nil && t.ID != "" {
@@ -147,51 +195,88 @@ func (c *Client) openStream(ctx context.Context, method string, params any, out 
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("A2A-Version", ProtocolVersion)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
 		return fmt.Errorf("stream: %s %s", resp.Status, b)
 	}
+	// Servers reject streams before the first event with a plain JSON-RPC
+	// error body (HTTP 200, application/json) — surface it instead of
+	// silently scanning an empty "stream".
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		var env struct {
+			Error *JSONRPCError `json:"error"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodySize)).Decode(&env); err == nil && env.Error != nil {
+			return fmt.Errorf("stream rpc: %d %s", env.Error.Code, env.Error.Message)
+		}
+		return fmt.Errorf("stream: unexpected content-type %q", ct)
+	}
 
+	// dispatch handles one accumulated SSE event payload. Malformed
+	// payloads are skipped — the Client carries no logger by design.
+	dispatch := func(payload string) (done bool, err error) {
+		var env struct {
+			Result StreamResponse `json:"result"`
+			Error  *JSONRPCError  `json:"error"`
+		}
+		if jsonErr := json.Unmarshal([]byte(payload), &env); jsonErr != nil {
+			return false, nil
+		}
+		if env.Error != nil {
+			return true, fmt.Errorf("stream rpc: %d %s", env.Error.Code, env.Error.Message)
+		}
+		select {
+		case out <- env.Result:
+		case <-ctx.Done():
+			return true, ctx.Err()
+		}
+		// terminate if statusUpdate.final == true
+		if env.Result.StatusUpdate != nil && env.Result.StatusUpdate.Final {
+			return true, nil
+		}
+		return false, nil
+	}
+
+	// SSE parsing per the spec: consecutive "data:" lines accumulate and
+	// are joined with "\n"; a blank line dispatches the event.
 	br := bufio.NewReader(resp.Body)
+	var data []string
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if len(data) > 0 {
+					_, derr := dispatch(strings.Join(data, "\n"))
+					return derr
+				}
 				return nil
 			}
 			return err
 		}
 		line = strings.TrimRight(line, "\r\n")
-		if !strings.HasPrefix(line, "data:") {
+		if line == "" { // event boundary
+			if len(data) > 0 {
+				payload := strings.Join(data, "\n")
+				data = data[:0]
+				if done, derr := dispatch(payload); done {
+					return derr
+				}
+			}
 			continue
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" {
+		if strings.HasPrefix(line, ":") { // comment / keepalive
 			continue
 		}
-		var env struct {
-			Result StreamResponse `json:"result"`
-			Error  *JSONRPCError  `json:"error"`
+		if after, ok := strings.CutPrefix(line, "data:"); ok {
+			// Per SSE spec, a single leading space after the colon is
+			// stripped; further whitespace is payload.
+			data = append(data, strings.TrimPrefix(after, " "))
 		}
-		if err := json.Unmarshal([]byte(payload), &env); err != nil {
-			continue
-		}
-		if env.Error != nil {
-			return fmt.Errorf("stream rpc: %d %s", env.Error.Code, env.Error.Message)
-		}
-		select {
-		case out <- env.Result:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		// terminate if statusUpdate.final == true
-		if env.Result.StatusUpdate != nil && env.Result.StatusUpdate.Final {
-			return nil
-		}
+		// Other SSE fields (event:, id:, retry:) are ignored.
 	}
 }

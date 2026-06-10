@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/kardianos/service"
 
@@ -37,11 +39,12 @@ func init() {
 
 // RunService dispatches a "service" subaction.
 func RunService(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+	if len(args) == 0 {
+		printServiceUsage(stderr)
+		return 2
+	}
+	if args[0] == "-h" || args[0] == "--help" {
 		printServiceUsage(stdout)
-		if len(args) == 0 {
-			return 2
-		}
 		return 0
 	}
 	action := args[0]
@@ -84,38 +87,51 @@ func printServiceUsage(w io.Writer) {
 	fmt.Fprintln(w, "Supervisor: launchd on macOS, systemd-user on Linux/WSL2, Windows Service Manager on Windows.")
 }
 
+// serviceStopTimeout bounds how long Stop waits for the directory
+// goroutine to drain before giving up (the supervisor will then kill us).
+const serviceStopTimeout = 5 * time.Second
+
 // directoryService implements service.Interface. The supervisor calls
-// Start asynchronously; Start launches the directory in a goroutine and
-// returns. Stop terminates it via the same signal-driven shutdown path used
-// by `a2abridge directory`.
+// Start asynchronously; Start launches the directory core in a goroutine
+// and returns. Stop cancels the serve context and waits for the goroutine
+// to drain — this works on every platform, including Windows SCM where no
+// stop signal is ever delivered to the process.
 type directoryService struct {
 	addr   string
 	logger service.Logger
+	cancel context.CancelFunc
 	exit   chan struct{}
 }
 
 func (s *directoryService) Start(_ service.Service) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
 	s.exit = make(chan struct{})
 	go func() {
-		// Reuse the directory subcommand body verbatim. Supervisor stdout/stderr
-		// are wired into the platform log (Console.app / journalctl / Event Log).
-		code := RunDirectory([]string{"-addr", s.addr}, os.Stdout, os.Stderr)
+		defer close(s.exit)
+		// Reuse the directory subcommand core. Supervisor stdout is wired
+		// into the platform log (Console.app / journalctl / Event Log).
+		code := serveDirectory(ctx, s.addr, os.Stdout)
 		if code != 0 && s.logger != nil {
 			_ = s.logger.Errorf("directory exited with code %d", code)
 		}
-		close(s.exit)
 	}()
 	return nil
 }
 
 func (s *directoryService) Stop(_ service.Service) error {
-	// RunDirectory listens on SIGTERM/SIGINT. The supervisor will deliver
-	// the appropriate stop signal; we wait for the goroutine to drain.
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.exit == nil {
+		return nil
+	}
 	select {
 	case <-s.exit:
-	default:
+		return nil
+	case <-time.After(serviceStopTimeout):
+		return fmt.Errorf("directory did not shut down within %s", serviceStopTimeout)
 	}
-	return nil
 }
 
 // buildService composes a service.Service for the given listen address and
@@ -126,11 +142,10 @@ func buildService(addr string) (service.Service, *directoryService, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("locate own executable: %w", err)
 	}
-	exe, err = filepath.EvalSymlinks(exe)
-	if err == nil {
-		// best-effort: resolve symlinks so the supervisor unit always points
-		// at the real binary, even if the user later moves a symlink.
-		_ = exe
+	// Best-effort: resolve symlinks so the supervisor unit always points
+	// at the real binary, even if the user later moves a symlink.
+	if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
+		exe = resolved
 	}
 
 	prog := &directoryService{addr: addr}
@@ -160,11 +175,11 @@ func platformOptions() service.KeyValue {
 	opt := service.KeyValue{}
 	switch runtime.GOOS {
 	case "darwin":
-		opt["UserService"] = true            // ~/Library/LaunchAgents
-		opt["RunAtLoad"] = true               // start at login
-		opt["KeepAlive"] = true               // restart on crash
+		opt["UserService"] = true // ~/Library/LaunchAgents
+		opt["RunAtLoad"] = true   // start at login
+		opt["KeepAlive"] = true   // restart on crash
 	case "linux":
-		opt["UserService"] = true            // ~/.config/systemd/user
+		opt["UserService"] = true // ~/.config/systemd/user
 		opt["Restart"] = "on-failure"
 		opt["LogOutput"] = true
 		// systemd will only auto-start at login if `loginctl enable-linger <user>`
@@ -235,7 +250,11 @@ func svcInstall(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func svcAction(action string, _ []string, stdout, stderr io.Writer) int {
+func svcAction(action string, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		fmt.Fprintf(stderr, "a2abridge service %s: unexpected arguments: %s\n", action, strings.Join(args, " "))
+		return 2
+	}
 	svc, _, err := buildService(defaultDirectoryAddr)
 	if err != nil {
 		fmt.Fprintf(stderr, "a2abridge service %s: %v\n", action, err)
@@ -249,7 +268,11 @@ func svcAction(action string, _ []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func svcStatus(_ []string, stdout, stderr io.Writer) int {
+func svcStatus(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		fmt.Fprintf(stderr, "a2abridge service status: unexpected arguments: %s\n", strings.Join(args, " "))
+		return 2
+	}
 	svc, _, err := buildService(defaultDirectoryAddr)
 	if err != nil {
 		fmt.Fprintf(stderr, "a2abridge service status: %v\n", err)
@@ -273,6 +296,9 @@ func svcRun(args []string, _, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", defaultDirectoryAddr, "listen address (filled by service unit)")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 

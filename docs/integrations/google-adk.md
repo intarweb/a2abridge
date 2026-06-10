@@ -30,7 +30,7 @@ requests.post(
 )
 ```
 
-The ADK agent's Agent Card on `/.well-known/a2a` is now discoverable to
+The ADK agent's Agent Card on `/.well-known/agent-card.json` is now discoverable to
 every Claude/Codex bridge on the same machine. `a2abridge doctor` will
 list it as one of the registered peers.
 
@@ -69,7 +69,7 @@ same env flag.
 ## Caveats
 
 - ADK 1.0 still ships some agents with `streaming=False` in the Agent
-  Card. a2abridge falls back to non-streaming `SendMessage` automatically
+  Card. a2abridge falls back to non-streaming `message/send` automatically
   when `card.capabilities.streaming` is false.
 - ADK uses `protocolVersion: "1.0"` per spec. If you see version errors
   in `a2abridge doctor`, both sides need to be on protocol 1.0+.

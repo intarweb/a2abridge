@@ -4,27 +4,98 @@ All notable changes to a2abridge are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] — 2026-05-09
+## [3.0.0] — 2026-06-10
 
-Cross-machine + reliability follow-up. Same single binary, additive only.
+Spec-compliance and hardening release. The JSON-RPC wire format now
+matches the A2A 1.0 specification exactly, which is a breaking change
+for v2.x peers (legacy method names are still accepted as aliases, but
+enum values and the Part union changed on the wire). Upgrade all peers
+in a mesh together.
 
-### Added
+### Changed — A2A 1.0 spec compliance (breaking)
 
-- **Push notifications now retry** with exponential backoff (200 ms →
-  3.2 s, 5 attempts, per-attempt 5 s timeout) on 5xx and network errors.
-  4xx responses are treated as permanent and not retried.
-- **`a2abridge service install --federation`** generates an ed25519
-  cert + key under `~/.a2abridge/tls` and prints the env block to wire
-  TLS into your IDE config in one step. Optional `--cn <name>` overrides
-  the hostname-derived common name.
-- **mDNS / DNS-SD discovery** (`A2A_MDNS=1`): bridges publish themselves
-  on `_a2a._tcp.local.` and discover LAN peers without a shared directory.
-  Useful on multi-laptop dev setups and conference Wi-Fi.
+- **JSON-RPC method names** follow the spec: `message/send`,
+  `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`,
+  `tasks/pushNotificationConfig/{set,get,list,delete}`,
+  `agent/getAuthenticatedExtendedCard`. Old `a2a.*` names are accepted
+  as deprecated aliases for rolling upgrades. `tasks/list` remains a
+  documented non-spec extension.
+- **TaskState / Role wire values** are now the spec JSON forms
+  (`submitted`, `working`, `input-required`, `completed`, `canceled`,
+  `failed`, `rejected`, `auth-required`; `user` / `agent`) instead of
+  proto-style enum strings.
+- **Agent card** is served at `/.well-known/agent-card.json` (spec
+  location); `/.well-known/a2a` is kept as a legacy alias and the
+  client falls back to it on 404.
+- **Part** serializes as the spec discriminated union
+  (`{"kind":"text"|"file"|"data", ...}` with nested
+  `file:{bytes,uri,mimeType,name}`); the legacy flat shape is still
+  accepted on input. `Message`/`Task` now carry `kind` discriminators.
+- Spec error codes are reachable: `-32002 TaskNotCancelable`,
+  `-32003 PushNotSupported`, `-32004 UnsupportedOperation`,
+  `-32602 InvalidParams` via exported sentinel errors.
+- REST endpoints under `/v1/` are now documented as a non-spec
+  convenience API (the spec binding is JSON-RPC at `POST /`).
 
-### Changed
+### Security
 
-- Bumped `golang.org/x/net` (transitive via mDNS) to v0.54+ so the
-  `syscall.recvmsg` linker error on Go 1.25 is gone.
+- **PII screening**: private-key redaction now removes the whole PEM
+  block (previously only the BEGIN marker was stripped while the key
+  body leaked through); screening is applied to **all** outbound paths
+  (`a2a_send_message`, `a2a_send_streaming`, `a2a_complete_task` —
+  previously only the first).
+- **mTLS**: enabling TLS without `A2A_TRUST_ROOTS` is now a hard
+  configuration error instead of silently verifying client certs
+  against the system root pool. Allow-list matching also considers IP
+  SANs. Certificate serials come from crypto/rand.
+- **Self-update and installers verify SHA256**: releases now publish
+  `checksums.txt`; `a2abridge update`, `install.sh` and `install.ps1`
+  refuse unverified archives. `A2A_REPO` override prints a loud warning.
+- Inbox snapshots are written `0600`; IDE config writes preserve
+  original permissions (new files `0600`) and are atomic
+  (temp + rename). `.a2a/` state dirs get a `.gitignore`.
+
+### Fixed
+
+- Double delivery race between the SSE fast path and outgoing-task
+  polling; the `on-outgoing-reply` hook now also fires on the polling
+  path.
+- The headless responder no longer answers its own synthetic
+  outgoing-reply messages (each one previously spawned a paid LLM run).
+- Terminal tasks and push configs are evicted after a TTL (30 min)
+  instead of growing without bound; messages to terminal tasks are
+  rejected with `-32002`.
+- Streaming errors are no longer swallowed: server-side handler
+  failures surface as JSON-RPC errors (pre-stream) or a final SSE error
+  event (mid-stream); the client detects non-SSE error responses and
+  joins multi-line `data:` frames per the SSE spec.
+- `Client.call` honors the configured `http.Client` (custom TLS/proxy
+  transports were silently ignored); directory calls have 5 s timeouts;
+  peer agent cards are fetched concurrently; graceful unregister works
+  during shutdown.
+- All POST bodies are capped (8 MiB) with `http.MaxBytesReader`;
+  client reads are bounded.
+- Continue IDE was never auto-detected (and never uninstalled) because
+  directory detection was broken; Claude Code MCP registration goes to
+  `~/.claude.json` (the file Claude Code actually reads) while hooks
+  stay in `~/.claude/settings.json`.
+- JSON config merging preserves integers larger than 2^53
+  (`json.Number` round-trip) instead of corrupting them to floats.
+- Binary self-replacement is atomic with checksum verification, bounded
+  extraction and real semver comparison; `update --check` exits 1 when
+  an update is available.
+- `service stop` for the directory now actually waits for graceful
+  shutdown (works under Windows SCM, which has no signal path).
+- tmux worker prompts are sent literally (`send-keys -l --`) so
+  key-name-like prompts aren't interpreted, with a startup delay so the
+  TUI doesn't swallow input.
+- Prometheus metrics are actually incremented (7 of 9 counters were
+  never wired); the peers gauge updates on register/unregister/GC.
+- Docker images embed the release version via ldflags (previously
+  reported `0.2.0-dev`); `windows/arm64` added to the release matrix.
+- Many smaller fixes: rune-safe truncation, AppleScript newline
+  escaping, mDNS TXT URL validation, directory registry URL validation
+  and stoppable GC, consistent help/exit codes, dead code removal.
 
 ## [2.0.0] — 2026-05-09
 
@@ -49,6 +120,28 @@ LlamaIndex peers into their local mesh.
 ### Removed
 
 - Nothing. v2.0 is purely additive on top of v1.1.
+
+## [1.1.0] — 2026-05-09
+
+Cross-machine + reliability follow-up. Same single binary, additive only.
+
+### Added
+
+- **Push notifications now retry** with exponential backoff (200 ms →
+  3.2 s, 5 attempts, per-attempt 5 s timeout) on 5xx and network errors.
+  4xx responses are treated as permanent and not retried.
+- **`a2abridge service install --federation`** generates an ed25519
+  cert + key under `~/.a2abridge/tls` and prints the env block to wire
+  TLS into your IDE config in one step. Optional `--cn <name>` overrides
+  the hostname-derived common name.
+- **mDNS / DNS-SD discovery** (`A2A_MDNS=1`): bridges publish themselves
+  on `_a2a._tcp.local.` and discover LAN peers without a shared directory.
+  Useful on multi-laptop dev setups and conference Wi-Fi.
+
+### Changed
+
+- Bumped `golang.org/x/net` (transitive via mDNS) to v0.54+ so the
+  `syscall.recvmsg` linker error on Go 1.25 is gone.
 
 ## [1.0.0] — 2026-05-09
 

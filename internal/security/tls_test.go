@@ -112,16 +112,41 @@ func TestServerTLSConfigEnforcesClientCert(t *testing.T) {
 	}
 }
 
+// TestTLSConfigsRequireTrustRoots is the regression test for the
+// system-pool fallback: with cert+key set but no trust roots, both
+// config builders must refuse to start instead of silently verifying
+// peer certificates against the system root pool (which would accept
+// any public-CA cert with the matching EKU).
+func TestTLSConfigsRequireTrustRoots(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath, err := GenerateEd25519Cert(dir, "lonely-peer")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := FederationConfig{
+		CertFile: certPath,
+		KeyFile:  keyPath,
+		// TrustRoots intentionally empty.
+	}
+	if _, err := cfg.ServerTLSConfig(); err == nil {
+		t.Error("ServerTLSConfig accepted empty TrustRoots; system-pool fallback regression")
+	}
+	if _, err := cfg.ClientTLSConfig(); err == nil {
+		t.Error("ClientTLSConfig accepted empty TrustRoots; system-pool fallback regression")
+	}
+}
+
 // TestFederationFromEnvSeparators verifies the colon/semicolon-tolerant
 // path splitter for A2A_TRUST_ROOTS.
 func TestFederationFromEnvSeparators(t *testing.T) {
 	cases := map[string][]string{
-		"":           nil,
-		"a":          {"a"},
-		"a:b":        {"a", "b"},
-		"a;b":        {"a", "b"},
-		"a:b;c":      {"a", "b", "c"},
-		" a : b ":    {"a", "b"},
+		"":        nil,
+		"a":       {"a"},
+		"a:b":     {"a", "b"},
+		"a;b":     {"a", "b"},
+		"a:b;c":   {"a", "b", "c"},
+		" a : b ": {"a", "b"},
 	}
 	for in, want := range cases {
 		t.Setenv("A2A_TRUST_ROOTS", in)

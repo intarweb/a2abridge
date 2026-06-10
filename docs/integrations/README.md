@@ -31,6 +31,6 @@ see the main [README → Security model](../../README.md#security-model).
 
 The framework versions listed above are the minimum for stable A2A
 interop as of May 2026. Always verify the framework's Agent Card on
-`/.well-known/a2a` returns `"protocolVersion": "1.0"` and
+`/.well-known/agent-card.json` returns `"protocolVersion": "1.0"` and
 `"capabilities.streaming": true` before pointing production traffic at
 it.

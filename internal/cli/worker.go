@@ -7,6 +7,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 func init() {
@@ -20,6 +21,13 @@ func init() {
 const (
 	defaultWorkerSession = "a2abridge-worker"
 	defaultWorkerCmd     = "claude"
+
+	// workerPaneTimeout bounds the wait for the tmux pane to come up;
+	// workerSplashDelay then gives the agent's TUI time to finish its
+	// splash screen so the seeded prompt isn't swallowed.
+	workerPaneTimeout = 2 * time.Second
+	workerPanePoll    = 100 * time.Millisecond
+	workerSplashDelay = 1500 * time.Millisecond
 )
 
 // RunWorker manages an always-on Claude (or any CLI agent) inside a
@@ -31,11 +39,12 @@ const (
 // pre-flight check. On Windows the worker subcommand is unsupported
 // (PowerShell jobs are a different beast); we surface an explicit error.
 func RunWorker(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+	if len(args) == 0 {
+		printWorkerUsage(stderr)
+		return 2
+	}
+	if args[0] == "-h" || args[0] == "--help" {
 		printWorkerUsage(stdout)
-		if len(args) == 0 {
-			return 2
-		}
 		return 0
 	}
 
@@ -100,11 +109,21 @@ func workerStart(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if *prompt != "" {
-		// send-keys with " Enter" submits the prompt. We pause briefly so
-		// the agent has a chance to finish its splash before we type.
-		seed := exec.Command("tmux", "send-keys", "-t", *session, *prompt, "Enter")
+		// Wait for the pane and let the agent finish its splash before we
+		// type, otherwise the TUI swallows the seeded prompt.
+		waitForWorkerPane(*session)
+		// -l sends the prompt literally (no tmux key-name interpretation);
+		// the Enter keypress goes in a second call so it IS interpreted.
+		//nolint:gosec // G204: args are the user's own CLI flags, not remote input.
+		seed := exec.Command("tmux", "send-keys", "-t", *session, "-l", "--", *prompt)
 		if out, err := seed.CombinedOutput(); err != nil {
 			fmt.Fprintf(stderr, "tmux send-keys failed: %v\n%s", err, out)
+			return 1
+		}
+		//nolint:gosec // G204: args are the user's own CLI flags, not remote input.
+		enter := exec.Command("tmux", "send-keys", "-t", *session, "Enter")
+		if out, err := enter.CombinedOutput(); err != nil {
+			fmt.Fprintf(stderr, "tmux send-keys (Enter) failed: %v\n%s", err, out)
 			return 1
 		}
 	}
@@ -180,11 +199,24 @@ func workerAttach(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// waitForWorkerPane polls until the session's pane exists (or the timeout
+// elapses), then sleeps a fixed grace period for the agent's TUI splash.
+func waitForWorkerPane(session string) {
+	deadline := time.Now().Add(workerPaneTimeout)
+	for time.Now().Before(deadline) {
+		if err := exec.Command("tmux", "list-panes", "-t", session).Run(); err == nil {
+			break
+		}
+		time.Sleep(workerPanePoll)
+	}
+	time.Sleep(workerSplashDelay)
+}
+
 // tmuxHasSession returns whether a session of that name is alive, plus
 // the matching `tmux display-message` line for diagnostics. The
 // `has-session` exit code is 0 when present, 1 when missing, 255 on
 // other errors.
-func tmuxHasSession(name string) (bool, string) {
+func tmuxHasSession(name string) (running bool, detail string) {
 	if err := exec.Command("tmux", "has-session", "-t", name).Run(); err != nil {
 		return false, ""
 	}

@@ -32,20 +32,27 @@ func RunDirectory(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return serveDirectory(ctx, *addr, stdout)
+}
+
+// serveDirectory is the directory daemon core, shared between the CLI
+// subcommand (cancelled by SIGTERM/SIGINT) and the OS service wrapper
+// (cancelled by the supervisor's Stop call). Blocks until ctx is done or
+// the listener fails.
+func serveDirectory(ctx context.Context, addr string, stdout io.Writer) int {
 	log := slog.New(slog.NewJSONHandler(stdout, nil))
 	reg := directory.New(log)
 	srv := &http.Server{
-		Addr:              *addr,
+		Addr:              addr,
 		Handler:           reg.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	errc := make(chan error, 1)
 	go func() {
-		log.Info("directory listening", "addr", *addr)
+		log.Info("directory listening", "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 			return

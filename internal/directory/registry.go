@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -22,38 +23,59 @@ type Registry struct {
 	entries map[string]Entry // url -> entry
 	log     *slog.Logger
 	ttl     time.Duration
+
+	quit      chan struct{}
+	closeOnce sync.Once
 }
 
 func New(log *slog.Logger) *Registry {
-	r := &Registry{entries: map[string]Entry{}, log: log, ttl: 90 * time.Second}
+	r := &Registry{
+		entries: map[string]Entry{},
+		log:     log,
+		ttl:     90 * time.Second,
+		quit:    make(chan struct{}),
+	}
 	go r.gc()
 	return r
+}
+
+// Close stops the background gc goroutine. Safe to call multiple times.
+func (r *Registry) Close() {
+	r.closeOnce.Do(func() { close(r.quit) })
 }
 
 func (r *Registry) gc() {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
-	for range t.C {
-		cutoff := time.Now().Add(-r.ttl)
-		r.mu.Lock()
-		for k, e := range r.entries {
-			if e.LastSeen.Before(cutoff) {
-				delete(r.entries, k)
+	for {
+		select {
+		case <-r.quit:
+			return
+		case <-t.C:
+			cutoff := time.Now().Add(-r.ttl)
+			r.mu.Lock()
+			for k, e := range r.entries {
+				if e.LastSeen.Before(cutoff) {
+					delete(r.entries, k)
+				}
 			}
+			metrics.SetPeers(len(r.entries))
+			r.mu.Unlock()
 		}
-		r.mu.Unlock()
 	}
 }
 
 func (r *Registry) Register(url string) {
 	r.mu.Lock()
 	r.entries[url] = Entry{URL: url, LastSeen: time.Now()}
+	metrics.SetPeers(len(r.entries))
 	r.mu.Unlock()
 }
 
 func (r *Registry) Unregister(url string) {
 	r.mu.Lock()
 	delete(r.entries, url)
+	metrics.SetPeers(len(r.entries))
 	r.mu.Unlock()
 }
 
@@ -67,21 +89,29 @@ func (r *Registry) List() []Entry {
 	return out
 }
 
+// validAgentURL rejects anything that isn't an absolute http(s) URL —
+// the registry hands these out to every peer, so junk here propagates.
+func validAgentURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+
 func (r *Registry) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	mux.Handle("GET /metrics", metrics.Handler())
 	mux.HandleFunc("GET /agents", func(w http.ResponseWriter, _ *http.Request) {
-		entries := r.List()
-		metrics.SetPeers(len(entries))
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(entries)
+		_ = json.NewEncoder(w).Encode(r.List())
 	})
 	mux.HandleFunc("POST /register", func(w http.ResponseWriter, req *http.Request) {
 		var body struct {
 			URL string `json:"url"`
 		}
-		if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.URL == "" {
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil || !validAgentURL(body.URL) {
 			http.Error(w, "bad request", 400)
 			return
 		}
@@ -103,7 +133,7 @@ func (r *Registry) Routes() http.Handler {
 		var body struct {
 			URL string `json:"url"`
 		}
-		if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.URL == "" {
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil || !validAgentURL(body.URL) {
 			http.Error(w, "bad request", 400)
 			return
 		}

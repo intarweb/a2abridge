@@ -6,15 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
-	"time"
 )
 
-// REST endpoints per A2A 1.0 §7.3 (HTTP+REST binding). Mounted alongside
-// the JSON-RPC POST / route, they let clients that don't speak JSON-RPC
-// (cURL scripts, browser fetch(), webhook callers) consume the same
-// handler. The bodies are direct JSON of the underlying types — no RPC
-// envelope.
+// Non-spec convenience REST API. The A2A 1.0 spec binding served by this
+// package is JSON-RPC at POST /; these routes are a custom dialect mounted
+// alongside it so clients that don't speak JSON-RPC (cURL scripts, browser
+// fetch(), webhook callers) can consume the same handler. The bodies are
+// direct JSON of the underlying types — no RPC envelope.
 //
 // Path table:
 //
@@ -24,7 +22,7 @@ import (
 //	GET    /v1/tasks/{id}              → GetTask
 //	POST   /v1/tasks/{id}/cancel       → CancelTask
 //	GET    /v1/tasks/{id}/stream       → SubscribeToTask  (SSE)
-//	GET    /v1/agent                   → GetExtendedAgentCard
+//	GET    /v1/agent                   → agent card
 //	POST   /v1/tasks/{id}/push         → CreatePushConfig
 //	GET    /v1/tasks/{id}/push         → ListPushConfigs
 //	DELETE /v1/tasks/{id}/push         → DeletePushConfig (all)
@@ -52,20 +50,33 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// writeRESTErr maps internal handler errors to HTTP status codes per the
-// A2A spec mapping conventions (§7.3, §8). TaskNotFound → 404, validation
-// → 400, push-not-supported → 501, anything else → 500.
+// writeRESTErr maps the package sentinel errors to HTTP status codes:
+// ErrTaskNotFound → 404, ErrTaskNotCancelable → 409, ErrInvalidParams →
+// 400, ErrPushNotSupported / ErrUnsupportedOperation → 501, else → 500.
 func writeRESTErr(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
 		status = http.StatusNotFound
-	case strings.Contains(err.Error(), "required"):
+	case errors.Is(err, ErrTaskNotCancelable):
+		status = http.StatusConflict
+	case errors.Is(err, ErrInvalidParams):
 		status = http.StatusBadRequest
-	case strings.Contains(err.Error(), "not supported"):
+	case errors.Is(err, ErrPushNotSupported), errors.Is(err, ErrUnsupportedOperation):
 		status = http.StatusNotImplemented
 	}
 	writeJSON(w, status, map[string]any{"error": err.Error()})
+}
+
+// decodeBody enforces the body size cap and decodes JSON into dst,
+// wrapping decode failures in ErrInvalidParams so writeRESTErr maps them
+// to 400.
+func decodeBody(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidParams, err)
+	}
+	return nil
 }
 
 func (s *Server) restAgentCard(w http.ResponseWriter, _ *http.Request) {
@@ -74,8 +85,8 @@ func (s *Server) restAgentCard(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) restSendMessage(w http.ResponseWriter, r *http.Request) {
 	var p MessageSendParams
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		writeRESTErr(w, fmt.Errorf("body required: %v", err))
+	if err := decodeBody(w, r, &p); err != nil {
+		writeRESTErr(w, err)
 		return
 	}
 	task, msg, err := s.Handler.SendMessage(r.Context(), p)
@@ -83,11 +94,14 @@ func (s *Server) restSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeRESTErr(w, err)
 		return
 	}
-	if task != nil {
+	switch {
+	case task != nil:
 		writeJSON(w, http.StatusOK, task)
-		return
+	case msg != nil:
+		writeJSON(w, http.StatusOK, msg)
+	default:
+		writeRESTErr(w, errors.New("handler returned no result"))
 	}
-	writeJSON(w, http.StatusOK, msg)
 }
 
 func (s *Server) restListTasks(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +135,7 @@ func (s *Server) restCancelTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) restSendStreaming(w http.ResponseWriter, r *http.Request) {
 	var p MessageSendParams
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	if err := decodeBody(w, r, &p); err != nil {
 		writeRESTErr(w, err)
 		return
 	}
@@ -137,59 +151,35 @@ func (s *Server) restSubscribeToTask(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// streamRESTRPC is the REST equivalent of streamRPC — same SSE framing,
-// just without the JSON-RPC envelope around each event.
+// streamRESTRPC is the REST flavour of streamRPC — same SSE machinery
+// (streamSSE), just without the JSON-RPC envelope around each event.
 func (s *Server) streamRESTRPC(
 	w http.ResponseWriter, r *http.Request,
 	run func(ctx context.Context, ch chan<- StreamResponse) error,
 ) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeRESTErr(w, errors.New("streaming unsupported"))
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-
-	ch := make(chan StreamResponse, 8)
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
-	go func() {
-		defer close(ch)
-		if err := run(ctx, ch); err != nil && !errors.Is(err, context.Canceled) {
-			s.Log.Warn("rest stream handler error", "err", err)
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev, ok := <-ch:
-			if !ok {
-				return
-			}
+	s.streamSSE(w, r, run,
+		func(ev StreamResponse) []byte {
 			b, _ := json.Marshal(ev)
-			fmt.Fprintf(w, "data: %s\n\n", b)
-			flusher.Flush()
-		case <-time.After(15 * time.Second):
-			fmt.Fprint(w, ": keepalive\n\n")
-			flusher.Flush()
-		}
-	}
+			return b
+		},
+		func(err error) []byte {
+			b, _ := json.Marshal(map[string]*JSONRPCError{
+				"error": {Code: taskErrCode(err), Message: err.Error()},
+			})
+			return b
+		},
+		writeRESTErr,
+	)
 }
 
 func (s *Server) restCreatePush(w http.ResponseWriter, r *http.Request) {
 	ph, ok := s.Handler.(PushHandler)
 	if !ok {
-		writeRESTErr(w, errors.New("push notifications not supported"))
+		writeRESTErr(w, ErrPushNotSupported)
 		return
 	}
 	var cfg PushNotificationConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	if err := decodeBody(w, r, &cfg); err != nil {
 		writeRESTErr(w, err)
 		return
 	}
@@ -206,7 +196,7 @@ func (s *Server) restCreatePush(w http.ResponseWriter, r *http.Request) {
 func (s *Server) restListPush(w http.ResponseWriter, r *http.Request) {
 	ph, ok := s.Handler.(PushHandler)
 	if !ok {
-		writeRESTErr(w, errors.New("push notifications not supported"))
+		writeRESTErr(w, ErrPushNotSupported)
 		return
 	}
 	out, err := ph.ListPushConfigs(r.Context(), r.PathValue("id"))
@@ -220,7 +210,7 @@ func (s *Server) restListPush(w http.ResponseWriter, r *http.Request) {
 func (s *Server) restDeletePushAll(w http.ResponseWriter, r *http.Request) {
 	ph, ok := s.Handler.(PushHandler)
 	if !ok {
-		writeRESTErr(w, errors.New("push notifications not supported"))
+		writeRESTErr(w, ErrPushNotSupported)
 		return
 	}
 	if err := ph.DeletePushConfig(r.Context(), PushNotificationConfigParams{TaskID: r.PathValue("id")}); err != nil {
@@ -233,7 +223,7 @@ func (s *Server) restDeletePushAll(w http.ResponseWriter, r *http.Request) {
 func (s *Server) restDeletePushOne(w http.ResponseWriter, r *http.Request) {
 	ph, ok := s.Handler.(PushHandler)
 	if !ok {
-		writeRESTErr(w, errors.New("push notifications not supported"))
+		writeRESTErr(w, ErrPushNotSupported)
 		return
 	}
 	if err := ph.DeletePushConfig(r.Context(), PushNotificationConfigParams{

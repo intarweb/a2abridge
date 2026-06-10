@@ -24,9 +24,13 @@ param(
 $ErrorActionPreference = "Stop"
 
 # --- detect platform --------------------------------------------------
-$arch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
-if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
-    $arch = "arm64"
+# Releases publish windows/amd64 and windows/arm64 only — fail fast on
+# anything else instead of building a download URL that 404s.
+$rawArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$arch = switch ($rawArch) {
+    "AMD64" { "amd64" }
+    "ARM64" { "arm64" }
+    default { throw "unsupported architecture: $rawArch (published Windows builds: amd64, arm64)" }
 }
 
 # --- resolve version --------------------------------------------------
@@ -46,8 +50,35 @@ $Url   = "https://github.com/$Repo/releases/download/$Version/$Asset"
 $Tmp   = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) ("a2abridge-install-" + [guid]::NewGuid().ToString("N").Substring(0,8)))
 try {
     Write-Host "→ downloading $Url"
-    Invoke-WebRequest -Uri $Url -OutFile (Join-Path $Tmp "a2abridge.zip")
-    Expand-Archive -Path (Join-Path $Tmp "a2abridge.zip") -DestinationPath $Tmp -Force
+    $Zip = Join-Path $Tmp "a2abridge.zip"
+    Invoke-WebRequest -Uri $Url -OutFile $Zip
+
+    # --- verify checksum (mandatory) ----------------------------------
+    Write-Host "→ verifying sha256 against checksums.txt"
+    $SumsUrl  = "https://github.com/$Repo/releases/download/$Version/checksums.txt"
+    $SumsFile = Join-Path $Tmp "checksums.txt"
+    try {
+        Invoke-WebRequest -Uri $SumsUrl -OutFile $SumsFile
+    } catch {
+        throw ("checksums.txt is missing from release $Version — this installer refuses unverified binaries. " +
+               "Older tags were published without checksums; pin a release that ships checksums.txt, e.g.: " +
+               '$env:A2A_VERSION = "vX.Y.Z"')
+    }
+    $Expected = $null
+    foreach ($line in Get-Content $SumsFile) {
+        $parts = $line.Trim() -split "\s+"
+        if ($parts.Count -ge 2 -and $parts[1] -eq $Asset) { $Expected = $parts[0]; break }
+    }
+    if (-not $Expected) {
+        throw "checksums.txt in release $Version has no entry for $Asset"
+    }
+    $Actual = (Get-FileHash -Algorithm SHA256 -Path $Zip).Hash
+    if ($Actual -ne $Expected) { # -ne is case-insensitive in PowerShell
+        throw "CHECKSUM MISMATCH for ${Asset}: expected $Expected, got $Actual. The download is corrupted or tampered with."
+    }
+    Write-Host "  sha256 OK: $Actual"
+
+    Expand-Archive -Path $Zip -DestinationPath $Tmp -Force
 
     $BinDir = Join-Path $Prefix "bin"
     New-Item -ItemType Directory -Path $BinDir -Force | Out-Null

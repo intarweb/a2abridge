@@ -10,7 +10,7 @@ You are part of a distributed team of AI coding agents. Other Claude / Codex / C
 
 ## Mental model
 
-- Each peer is identified by an Agent Card on `/.well-known/a2a` and a unique URL.
+- Each peer is identified by an Agent Card on `/.well-known/agent-card.json` and a unique URL.
 - Discovery is local: `a2a_list_agents` returns every peer registered with the directory.
 - Conversations are tasks: `a2a_send_message` creates a task on a peer; the peer replies via `a2a_complete_task` (or another `a2a_send_message` with the same `task_id`).
 - Your incoming queue is `a2a_inbox`. Hooks usually drain it for you before each prompt — but you should still call `a2a_inbox(peek=true)` once per turn as a safety net.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -69,6 +70,7 @@ func newTestServer(t *testing.T, h Handler) *httptest.Server {
 			URL:                "http://test",
 			PreferredTransport: "JSONRPC",
 			Version:            "0.0.0",
+			Capabilities:       AgentCapabilities{Streaming: true, ExtendedAgentCard: true},
 		},
 		Handler: h,
 		Log:     nopLogger(),
@@ -110,45 +112,80 @@ func TestRPCContractTable(t *testing.T) {
 	}{
 		{
 			name:      "send message returns task",
-			body:      `{"jsonrpc":"2.0","id":1,"method":"a2a.SendMessage","params":{"message":{"messageId":"m1","role":"ROLE_USER","parts":[{"text":"hi"}]}}}`,
+			body:      `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m1","role":"user","parts":[{"kind":"text","text":"hi"}]}}}`,
+			handler:   &fakeHandler{sendTask: &Task{ID: "t1", Status: TaskStatus{State: TaskStateSubmitted}}},
+			wantCode:  0,
+			wantField: `"id":"t1"`,
+		},
+		{
+			name:      "send message result carries kind task",
+			body:      `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m1","role":"user","parts":[{"kind":"text","text":"hi"}]}}}`,
+			handler:   &fakeHandler{sendTask: &Task{ID: "t1", Status: TaskStatus{State: TaskStateSubmitted}}},
+			wantCode:  0,
+			wantField: `"kind":"task"`,
+		},
+		{
+			name:      "send message with no result is internal error",
+			body:      `{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m1","role":"user","parts":[{"kind":"text","text":"hi"}]}}}`,
+			handler:   &fakeHandler{},
+			wantCode:  ErrCodeInternal,
+			wantField: `"code":-32603`,
+		},
+		{
+			name:      "legacy proto-style method name still accepted",
+			body:      `{"jsonrpc":"2.0","id":1,"method":"a2a.SendMessage","params":{"message":{"messageId":"m1","role":"user","parts":[{"text":"hi"}]}}}`,
 			handler:   &fakeHandler{sendTask: &Task{ID: "t1", Status: TaskStatus{State: TaskStateSubmitted}}},
 			wantCode:  0,
 			wantField: `"id":"t1"`,
 		},
 		{
 			name:      "get task happy path",
-			body:      `{"jsonrpc":"2.0","id":2,"method":"a2a.GetTask","params":{"id":"t1"}}`,
+			body:      `{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"id":"t1"}}`,
 			handler:   &fakeHandler{getTask: &Task{ID: "t1", Status: TaskStatus{State: TaskStateCompleted}}},
 			wantCode:  0,
-			wantField: `"state":"TASK_STATE_COMPLETED"`,
+			wantField: `"state":"completed"`,
 		},
 		{
 			name:      "get task not found",
-			body:      `{"jsonrpc":"2.0","id":3,"method":"a2a.GetTask","params":{"id":"missing"}}`,
+			body:      `{"jsonrpc":"2.0","id":3,"method":"tasks/get","params":{"id":"missing"}}`,
 			handler:   &fakeHandler{getErr: ErrTaskNotFound},
 			wantCode:  ErrCodeTaskNotFound,
 			wantField: `"code":-32001`,
 		},
 		{
 			name:      "list tasks",
-			body:      `{"jsonrpc":"2.0","id":4,"method":"a2a.ListTasks"}`,
+			body:      `{"jsonrpc":"2.0","id":4,"method":"tasks/list"}`,
 			handler:   &fakeHandler{listTasks: []Task{{ID: "a"}, {ID: "b"}}},
 			wantCode:  0,
 			wantField: `"id":"a"`,
 		},
 		{
 			name:      "cancel task",
-			body:      `{"jsonrpc":"2.0","id":5,"method":"a2a.CancelTask","params":{"id":"t1"}}`,
+			body:      `{"jsonrpc":"2.0","id":5,"method":"tasks/cancel","params":{"id":"t1"}}`,
 			handler:   &fakeHandler{cancelTask: &Task{ID: "t1", Status: TaskStatus{State: TaskStateCanceled}}},
 			wantCode:  0,
-			wantField: `"state":"TASK_STATE_CANCELED"`,
+			wantField: `"state":"canceled"`,
+		},
+		{
+			name:      "cancel task not cancelable",
+			body:      `{"jsonrpc":"2.0","id":5,"method":"tasks/cancel","params":{"id":"t1"}}`,
+			handler:   &fakeHandler{cancelErr: ErrTaskNotCancelable},
+			wantCode:  ErrCodeTaskNotCancelable,
+			wantField: `"code":-32002`,
 		},
 		{
 			name:      "extended agent card",
-			body:      `{"jsonrpc":"2.0","id":6,"method":"a2a.GetExtendedAgentCard"}`,
+			body:      `{"jsonrpc":"2.0","id":6,"method":"agent/getAuthenticatedExtendedCard"}`,
 			handler:   &fakeHandler{},
 			wantCode:  0,
 			wantField: `"name":"test-agent"`,
+		},
+		{
+			name:      "push config not supported",
+			body:      `{"jsonrpc":"2.0","id":6,"method":"tasks/pushNotificationConfig/set","params":{"taskId":"t1","pushNotificationConfig":{"url":"http://127.0.0.1:1/hook"}}}`,
+			handler:   &fakeHandler{},
+			wantCode:  ErrCodePushNotificationNotSupported,
+			wantField: `"code":-32003`,
 		},
 		{
 			name:      "unknown method",
@@ -159,7 +196,7 @@ func TestRPCContractTable(t *testing.T) {
 		},
 		{
 			name:      "wrong jsonrpc version",
-			body:      `{"jsonrpc":"1.0","id":8,"method":"a2a.ListTasks"}`,
+			body:      `{"jsonrpc":"1.0","id":8,"method":"tasks/list"}`,
 			handler:   &fakeHandler{},
 			wantCode:  ErrCodeInvalidRequest,
 			wantField: `"code":-32600`,
@@ -170,6 +207,13 @@ func TestRPCContractTable(t *testing.T) {
 			handler:   &fakeHandler{},
 			wantCode:  ErrCodeParse,
 			wantField: `"code":-32700`,
+		},
+		{
+			name:      "malformed json carries id null",
+			body:      `not json`,
+			handler:   &fakeHandler{},
+			wantCode:  ErrCodeParse,
+			wantField: `"id":null`,
 		},
 	}
 
@@ -201,7 +245,7 @@ func TestStreamingSendEmitsTaskAndStatusUpdate(t *testing.T) {
 	ts := newTestServer(t, h)
 	defer ts.Close()
 
-	body := `{"jsonrpc":"2.0","id":99,"method":"a2a.SendStreamingMessage","params":{"message":{"messageId":"x","role":"ROLE_USER","parts":[{"text":"go"}]}}}`
+	body := `{"jsonrpc":"2.0","id":99,"method":"message/stream","params":{"message":{"messageId":"x","role":"user","parts":[{"kind":"text","text":"go"}]}}}`
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/", strings.NewReader(body))
 	req.Header.Set("Accept", "text/event-stream")
 	resp, err := http.DefaultClient.Do(req)
@@ -222,10 +266,145 @@ func TestStreamingSendEmitsTaskAndStatusUpdate(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 	out := buf.String()
-	if !strings.Contains(out, `"state":"TASK_STATE_WORKING"`) {
-		t.Errorf("missing WORKING event:\n%s", out)
+	if !strings.Contains(out, `"state":"working"`) {
+		t.Errorf("missing working event:\n%s", out)
 	}
-	if !strings.Contains(out, `"state":"TASK_STATE_COMPLETED"`) {
-		t.Errorf("missing COMPLETED event:\n%s", out)
+	if !strings.Contains(out, `"state":"completed"`) {
+		t.Errorf("missing completed event:\n%s", out)
+	}
+	if !strings.Contains(out, `"kind":"task"`) {
+		t.Errorf("task event missing kind discriminator:\n%s", out)
+	}
+}
+
+func TestStreamErrorBeforeFirstEventIsJSONRPCError(t *testing.T) {
+	h := &fakeHandler{
+		subscribe: func(_ context.Context, _ string, _ chan<- StreamResponse) error {
+			return ErrTaskNotFound
+		},
+	}
+	ts := newTestServer(t, h)
+	defer ts.Close()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tasks/resubscribe","params":{"id":"missing"}}`
+	resp, err := http.Post(ts.URL+"/", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(out), `"code":-32001`) {
+		t.Errorf("missing TaskNotFound error:\n%s", out)
+	}
+}
+
+func TestStreamErrorMidStreamEmitsFinalErrorEvent(t *testing.T) {
+	h := &fakeHandler{
+		streamSend: func(_ context.Context, _ MessageSendParams, ch chan<- StreamResponse) error {
+			ch <- StreamResponse{Task: &Task{ID: "mid", Status: TaskStatus{State: TaskStateWorking}}}
+			return errors.New("backend exploded")
+		},
+	}
+	ts := newTestServer(t, h)
+	defer ts.Close()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"message/stream","params":{"message":{"messageId":"x","role":"user","parts":[{"kind":"text","text":"go"}]}}}`
+	resp, err := http.Post(ts.URL+"/", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(out), `"id":"mid"`) {
+		t.Errorf("missing first event:\n%s", out)
+	}
+	if !strings.Contains(string(out), `"code":-32603`) || !strings.Contains(string(out), "backend exploded") {
+		t.Errorf("missing mid-stream error event:\n%s", out)
+	}
+}
+
+func TestExtendedCardUnsupportedReturns32004(t *testing.T) {
+	srv := &Server{
+		Card: AgentCard{
+			ProtocolVersion: ProtocolVersion,
+			Name:            "plain-agent",
+			URL:             "http://test",
+			Version:         "0.0.0",
+			// Capabilities.ExtendedAgentCard deliberately false.
+		},
+		Handler: &fakeHandler{},
+		Log:     nopLogger(),
+	}
+	ts := httptest.NewServer(srv.Routes())
+	defer ts.Close()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"agent/getAuthenticatedExtendedCard"}`
+	resp, err := http.Post(ts.URL+"/", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(out), `"code":-32004`) {
+		t.Errorf("want UnsupportedOperation -32004, got:\n%s", out)
+	}
+}
+
+func TestAgentCardLegacyPathAlias(t *testing.T) {
+	ts := newTestServer(t, &fakeHandler{})
+	defer ts.Close()
+
+	for _, path := range []string{WellKnownPath, WellKnownPathLegacy} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var card AgentCard
+		err = json.NewDecoder(resp.Body).Decode(&card)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		if card.Name != "test-agent" {
+			t.Errorf("GET %s card.Name = %q", path, card.Name)
+		}
+	}
+}
+
+func TestRPCBodySizeLimit(t *testing.T) {
+	ts := newTestServer(t, &fakeHandler{})
+	defer ts.Close()
+
+	huge := `{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"id":"` +
+		strings.Repeat("x", 9<<20) + `"}}`
+	resp, err := http.Post(ts.URL+"/", "application/json", strings.NewReader(huge))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(out), `"code":-32700`) {
+		t.Errorf("oversized body should produce parse error, got:\n%s", out)
+	}
+}
+
+func TestRPCEndpointIsRootOnly(t *testing.T) {
+	ts := newTestServer(t, &fakeHandler{})
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/no/such/path", "application/json",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tasks/list"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("POST /no/such/path status = %d, want 404", resp.StatusCode)
 	}
 }

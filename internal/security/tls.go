@@ -70,6 +70,13 @@ func (c FederationConfig) ServerTLSConfig() (*tls.Config, error) {
 	if !c.Enabled() {
 		return nil, errors.New("federation not enabled (A2A_TLS_CERT/A2A_TLS_KEY unset)")
 	}
+	// Without explicit trust roots, ClientCAs would be nil and Go would
+	// verify client certs against the SYSTEM root pool — any public-CA
+	// certificate with a clientAuth EKU would be accepted. That silently
+	// turns mTLS into "any cert". Refuse to start instead.
+	if len(c.TrustRoots) == 0 {
+		return nil, errors.New("mTLS enabled but A2A_TRUST_ROOTS is empty; refusing to fall back to the system root pool for client-cert verification")
+	}
 	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("load cert/key: %w", err)
@@ -89,12 +96,22 @@ func (c FederationConfig) ServerTLSConfig() (*tls.Config, error) {
 		for _, n := range c.PeerAllowCN {
 			allow[strings.ToLower(n)] = true
 		}
+		// NOTE: the A2A_PEER_ALLOW allow-list is enforced server-side
+		// only — clients identify peers by the URL they dial, servers
+		// by this callback.
 		tc.VerifyConnection = func(state tls.ConnectionState) error {
 			if len(state.PeerCertificates) == 0 {
 				return errors.New("peer presented no certificate")
 			}
 			cert := state.PeerCertificates[0]
-			candidates := append([]string{strings.ToLower(cert.Subject.CommonName)}, cert.DNSNames...)
+			candidates := make([]string, 0, 1+len(cert.DNSNames)+len(cert.IPAddresses))
+			candidates = append(candidates, strings.ToLower(cert.Subject.CommonName))
+			candidates = append(candidates, cert.DNSNames...)
+			// Include IP SANs as strings so IP entries in A2A_PEER_ALLOW
+			// (e.g. "192.168.1.10") match peers identified by address.
+			for _, ip := range cert.IPAddresses {
+				candidates = append(candidates, ip.String())
+			}
 			for _, cand := range candidates {
 				if allow[strings.ToLower(cand)] {
 					return nil
@@ -112,6 +129,12 @@ func (c FederationConfig) ClientTLSConfig() (*tls.Config, error) {
 	if !c.Enabled() {
 		return nil, nil
 	}
+	// Same rationale as ServerTLSConfig: a nil RootCAs means peer servers
+	// are verified against the system pool, so a MITM holding any valid
+	// public-CA cert for the dialed host would be accepted.
+	if len(c.TrustRoots) == 0 {
+		return nil, errors.New("mTLS enabled but A2A_TRUST_ROOTS is empty; refusing to fall back to the system root pool for server-cert verification")
+	}
 	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("load cert/key: %w", err)
@@ -128,8 +151,8 @@ func (c FederationConfig) ClientTLSConfig() (*tls.Config, error) {
 }
 
 // loadTrustPool reads each path as a PEM bundle and returns a *x509.CertPool.
-// Empty paths list returns nil so the caller can decide between
-// "no roots = system pool" or "no roots = error".
+// Both TLS-config builders reject an empty TrustRoots list before calling
+// this, so the nil-on-empty return is defensive only.
 func loadTrustPool(paths []string) (*x509.CertPool, error) {
 	if len(paths) == 0 {
 		return nil, nil
@@ -178,8 +201,15 @@ func GenerateEd25519Cert(dir, commonName string) (certPath, keyPath string, err 
 		return "", "", fmt.Errorf("ed25519 gen: %w", err)
 	}
 
+	// 128-bit random serial: CA/Browser Forum baseline and collision-safe,
+	// unlike a wall-clock value which is guessable and can repeat.
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return "", "", fmt.Errorf("serial gen: %w", err)
+	}
+
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: commonName, Organization: []string{"a2abridge"}},
 		NotBefore:    time.Now().Add(-1 * time.Hour),
 		NotAfter:     time.Now().AddDate(10, 0, 0),

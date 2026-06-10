@@ -64,3 +64,31 @@ func TestURLFromEntryReturnsEmptyWhenIncomplete(t *testing.T) {
 		t.Errorf("expected empty for empty entry, got %q", got)
 	}
 }
+
+// TestURLFromEntrySkipsInvalidTXT — TXT records are attacker-controlled
+// LAN input; non-http(s) or unparseable url= values must be ignored and
+// the host:port fallback used instead.
+func TestURLFromEntrySkipsInvalidTXT(t *testing.T) {
+	cases := []struct {
+		name string
+		txt  string
+	}{
+		{"non-http scheme", "url=javascript:alert(1)"},
+		{"ftp scheme", "url=ftp://peer:21"},
+		{"no scheme", "url=peer:1234"},
+		{"missing host", "url=http://"},
+		{"garbage", "url=%zz://\x7f"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &zeroconf.ServiceEntry{
+				HostName: "peer.local.",
+				Port:     7654,
+				Text:     []string{"a2a-version=1.0", tc.txt},
+			}
+			if got := urlFromEntry(e); got != "http://peer.local:7654" {
+				t.Errorf("urlFromEntry = %q, want host:port fallback", got)
+			}
+		})
+	}
+}

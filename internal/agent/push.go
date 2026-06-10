@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/vbcherepanov/a2abridge/internal/a2a"
+	"github.com/vbcherepanov/a2abridge/internal/metrics"
 )
 
 // PushStore implements a2a.PushHandler. Per A2A 1.0 §9.5, peers register
@@ -180,12 +181,15 @@ func deliverWebhookWithPolicy(cfg a2a.PushNotificationConfig, body []byte, polic
 	for attempt := 1; attempt <= policy.maxAttempts; attempt++ {
 		ok, retryable := postOnce(cfg, body, policy.perAttempt)
 		if ok {
+			metrics.IncPushDelivered()
 			return
 		}
 		if !retryable {
+			metrics.IncPushFailed()
 			return // permanent failure (4xx, malformed URL, etc.)
 		}
 		if attempt == policy.maxAttempts {
+			metrics.IncPushFailed()
 			return
 		}
 		time.Sleep(delay)

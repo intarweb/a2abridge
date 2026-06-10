@@ -91,35 +91,19 @@ func runHook(eventName string, payload any) {
 		"A2A_EVENT_NAME="+eventName,
 		"A2A_EVENT="+string(body),
 	)
-	if from, ok := payloadField(payload, "from"); ok {
-		cmd.Env = append(cmd.Env, "A2A_EVENT_FROM="+from)
-	}
-	if task, ok := payloadField(payload, "taskId"); ok {
-		cmd.Env = append(cmd.Env, "A2A_EVENT_TASK="+task)
+	// Unmarshal the already-serialized payload once and pull the
+	// convenience env fields out of the same map.
+	var fields map[string]any
+	if err := json.Unmarshal(body, &fields); err == nil {
+		if from, ok := fields["from"].(string); ok {
+			cmd.Env = append(cmd.Env, "A2A_EVENT_FROM="+from)
+		}
+		if task, ok := fields["taskId"].(string); ok {
+			cmd.Env = append(cmd.Env, "A2A_EVENT_TASK="+task)
+		}
 	}
 
 	// Discard output — the hook is a fire-and-forget side effect. If the
 	// user wants to log, they can inside the script (>>~/log).
 	_ = cmd.Run()
-}
-
-// payloadField extracts a top-level string field from an arbitrary
-// payload. Returns (val, true) if found and stringy, otherwise ("", false).
-func payloadField(payload any, key string) (string, bool) {
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return "", false
-	}
-	var m map[string]any
-	if err := json.Unmarshal(b, &m); err != nil {
-		return "", false
-	}
-	v, ok := m[key]
-	if !ok {
-		return "", false
-	}
-	if s, ok := v.(string); ok {
-		return s, true
-	}
-	return "", false
 }

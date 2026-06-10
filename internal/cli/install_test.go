@@ -42,12 +42,12 @@ func mapEq(a, b map[string]bool) bool {
 
 func TestWriterSlugCanonical(t *testing.T) {
 	cases := map[string]string{
-		"Claude Code":      "claude-code",
-		"Codex CLI":        "codex",
-		"Cursor":           "cursor",
-		"Cline (VS Code)":  "cline",
-		"Continue":         "continue",
-		"Gemini CLI":       "gemini",
+		"Claude Code":     "claude-code",
+		"Codex CLI":       "codex",
+		"Cursor":          "cursor",
+		"Cline (VS Code)": "cline",
+		"Continue":        "continue",
+		"Gemini CLI":      "gemini",
 	}
 	for _, w := range ideconfig.AllWriters() {
 		want, ok := cases[w.Name()]
@@ -63,13 +63,13 @@ func TestWriterSlugCanonical(t *testing.T) {
 
 func TestShouldInstallExtras(t *testing.T) {
 	cases := map[string]bool{
-		"":                 true,  // auto
-		"auto":             true,
-		"all":              true,
-		"claude-code":      true,
-		"codex":            false, // claude-code not in scope
+		"":                  true, // auto
+		"auto":              true,
+		"all":               true,
+		"claude-code":       true,
+		"codex":             false, // claude-code not in scope
 		"claude-code,codex": true,
-		"codex,cursor":     false,
+		"codex,cursor":      false,
 	}
 	for in, want := range cases {
 		if got := shouldInstallExtras(in); got != want {

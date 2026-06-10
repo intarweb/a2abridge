@@ -22,10 +22,10 @@ import (
 var (
 	startedAt = time.Now()
 
-	messagesSent     atomic.Int64 // a2a.SendMessage: outbound
-	messagesReceived atomic.Int64 // a2a.SendMessage: inbound
-	tasksCompleted   atomic.Int64 // tasks reaching terminal state COMPLETED
-	tasksFailed      atomic.Int64 // tasks reaching terminal state FAILED/CANCELED/REJECTED
+	messagesSent     atomic.Int64 // message/send: outbound
+	messagesReceived atomic.Int64 // message/send: inbound
+	tasksCompleted   atomic.Int64 // tasks reaching terminal state completed
+	tasksFailed      atomic.Int64 // tasks reaching terminal state failed/canceled/rejected
 	pushDelivered    atomic.Int64 // webhook deliveries that returned 2xx
 	pushFailed       atomic.Int64 // webhook deliveries that exhausted retries
 
@@ -63,13 +63,13 @@ func emit(w io.Writer) {
 	fmt.Fprintf(w, "a2abridge_uptime_seconds %g\n", uptime)
 
 	counter(w, "a2abridge_messages_sent_total",
-		"Outbound a2a.SendMessage calls.", messagesSent.Load())
+		"Outbound message/send calls.", messagesSent.Load())
 	counter(w, "a2abridge_messages_received_total",
-		"Inbound a2a.SendMessage calls.", messagesReceived.Load())
+		"Inbound message/send calls.", messagesReceived.Load())
 	counter(w, "a2abridge_tasks_completed_total",
-		"Tasks that reached COMPLETED state.", tasksCompleted.Load())
+		"Tasks that reached completed state.", tasksCompleted.Load())
 	counter(w, "a2abridge_tasks_failed_total",
-		"Tasks that reached FAILED / CANCELED / REJECTED.", tasksFailed.Load())
+		"Tasks that reached failed / canceled / rejected.", tasksFailed.Load())
 	counter(w, "a2abridge_push_delivered_total",
 		"Push-notification webhooks that returned 2xx.", pushDelivered.Load())
 	counter(w, "a2abridge_push_failed_total",

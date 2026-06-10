@@ -250,13 +250,13 @@ func resolveStateDir(explicit string) (string, error) {
 		if err := os.MkdirAll(explicit, 0o755); err != nil {
 			return "", err
 		}
-		return explicit, nil
+		return explicit, ensureStateGitignore(explicit)
 	}
 	if cwd, err := os.Getwd(); err == nil {
 		candidate := filepath.Join(cwd, ".a2a")
 		if writable(cwd) {
 			if err := os.MkdirAll(candidate, 0o755); err == nil {
-				return candidate, nil
+				return candidate, ensureStateGitignore(candidate)
 			}
 		}
 	}
@@ -268,7 +268,18 @@ func resolveStateDir(explicit string) (string, error) {
 	if err := os.MkdirAll(fallback, 0o755); err != nil {
 		return "", err
 	}
-	return fallback, nil
+	return fallback, ensureStateGitignore(fallback)
+}
+
+// ensureStateGitignore drops a `*` .gitignore into the state dir so logs
+// and inbox snapshots never get committed when the dir lives inside a
+// repository. An existing .gitignore is left untouched.
+func ensureStateGitignore(dir string) error {
+	p := filepath.Join(dir, ".gitignore")
+	if _, err := os.Stat(p); err == nil {
+		return nil
+	}
+	return os.WriteFile(p, []byte("*\n"), 0o600)
 }
 
 func writable(dir string) bool {

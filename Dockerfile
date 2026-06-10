@@ -6,6 +6,12 @@
 FROM golang:1.25-alpine AS build
 WORKDIR /src
 
+# Build identification — wired by .github/workflows/docker.yml from the
+# git tag/SHA so `a2abridge version` inside the image reports the release.
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG DATE=unknown
+
 # Cache module fetch separately so source-only edits skip re-download.
 COPY go.mod go.sum ./
 RUN go mod download
@@ -13,7 +19,11 @@ RUN go mod download
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux \
-    go build -trimpath -ldflags="-s -w" -o /a2abridge ./cmd/a2abridge
+    go build -trimpath -ldflags="-s -w \
+      -X github.com/vbcherepanov/a2abridge/internal/buildinfo.Version=${VERSION} \
+      -X github.com/vbcherepanov/a2abridge/internal/buildinfo.Commit=${COMMIT} \
+      -X github.com/vbcherepanov/a2abridge/internal/buildinfo.BuildDate=${DATE}" \
+    -o /a2abridge ./cmd/a2abridge
 
 # distroless/static is the smallest base that has /etc/ssl/certs (needed
 # by HTTPS calls to GitHub for `a2abridge update`) and a non-root user.

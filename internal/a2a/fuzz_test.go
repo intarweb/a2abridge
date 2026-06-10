@@ -19,11 +19,13 @@ import (
 func FuzzJSONRPCDispatcher(f *testing.F) {
 	// Seed corpus — known-shape requests that exercise different branches.
 	for _, seed := range []string{
-		`{"jsonrpc":"2.0","id":1,"method":"a2a.SendMessage","params":{"message":{"messageId":"m","role":"ROLE_USER","parts":[{"text":"hi"}]}}}`,
-		`{"jsonrpc":"2.0","id":2,"method":"a2a.GetTask","params":{"id":"x"}}`,
-		`{"jsonrpc":"2.0","id":3,"method":"a2a.CancelTask","params":{"id":"x"}}`,
-		`{"jsonrpc":"2.0","id":4,"method":"a2a.ListTasks"}`,
-		`{"jsonrpc":"2.0","id":5,"method":"a2a.UnknownMethod"}`,
+		`{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m","role":"user","parts":[{"kind":"text","text":"hi"}]}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"id":"x"}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tasks/cancel","params":{"id":"x"}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tasks/list"}`,
+		`{"jsonrpc":"2.0","id":5,"method":"a2a.SendMessage","params":{"message":{"messageId":"m","role":"user","parts":[{"text":"hi"}]}}}`,
+		`{"jsonrpc":"2.0","id":6,"method":"a2a.UnknownMethod"}`,
+		`{"jsonrpc":"2.0","id":7,"method":"message/send","params":{"message":{"parts":[{"kind":"file","file":{"bytes":"aGk="}}]}}}`,
 		`{}`,
 		`null`,
 		`[]`,
@@ -83,7 +85,7 @@ func (fuzzHandler) GetTask(_ context.Context, _ TaskIDParams) (*Task, error) {
 func (fuzzHandler) CancelTask(_ context.Context, _ TaskIDParams) (*Task, error) {
 	return &Task{ID: "fuzz", Status: TaskStatus{State: TaskStateCanceled}}, nil
 }
-func (fuzzHandler) ListTasks(_ context.Context) ([]Task, error)                { return nil, nil }
+func (fuzzHandler) ListTasks(_ context.Context) ([]Task, error) { return nil, nil }
 func (fuzzHandler) Subscribe(_ context.Context, _ string, _ chan<- StreamResponse) error {
 	return nil
 }

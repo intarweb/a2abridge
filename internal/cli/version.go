@@ -9,7 +9,13 @@ import (
 )
 
 // RunVersion prints semver, commit, build date, Go runtime and target os/arch.
-func RunVersion(_ []string, stdout, _ io.Writer) int {
+func RunVersion(args []string, stdout, _ io.Writer) int {
+	if len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
+		fmt.Fprintln(stdout, "Usage: a2abridge version")
+		fmt.Fprintln(stdout)
+		fmt.Fprintln(stdout, "Print version, commit, build date, Go runtime and target platform.")
+		return 0
+	}
 	fmt.Fprintf(stdout,
 		"a2abridge %s\ncommit:    %s\nbuilt:     %s\ngo:        %s\nplatform:  %s/%s\n",
 		buildinfo.Version,

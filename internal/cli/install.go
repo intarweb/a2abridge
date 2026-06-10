@@ -70,11 +70,19 @@ func RunInstall(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		// Prefer the symlink-resolved path so configs survive directory moves.
-		if real, rerr := filepath.EvalSymlinks(me); rerr == nil {
-			me = real
+		if resolved, rerr := filepath.EvalSymlinks(me); rerr == nil {
+			me = resolved
 		}
 		exe = me
 	}
+	// IDE configs must reference an absolute path — the IDE's working
+	// directory is unrelated to wherever install was invoked from.
+	abs, err := filepath.Abs(exe)
+	if err != nil {
+		fmt.Fprintf(stderr, "install: resolve binary path %q: %v\n", exe, err)
+		return 1
+	}
+	exe = abs
 
 	spec := ideconfig.DefaultSpec(exe)
 	spec.Env["A2A_DIRECTORY"] = *directory
@@ -146,10 +154,26 @@ func RunInstall(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	written, planned, skipped, errored := 0, 0, 0, 0
+	for _, r := range results {
+		switch {
+		case r.Error != nil:
+			errored++
+		case r.Skipped:
+			skipped++
+		case r.Updated && r.DryRun:
+			planned++
+		case r.Updated:
+			written++
+		}
+	}
+	fmt.Fprintf(stdout, "\nSummary: %d written, %d planned, %d up to date, %d failed.\n",
+		written, planned, skipped, errored)
+
 	if !*apply {
-		fmt.Fprintln(stdout, "\nDry-run complete. Re-run with --apply to actually write.")
+		fmt.Fprintln(stdout, "Dry-run complete. Re-run with --apply to actually write.")
 	} else {
-		fmt.Fprintln(stdout, "\nInstall complete. Restart the listed IDEs to pick up the new MCP server.")
+		fmt.Fprintln(stdout, "Install complete. Restart the listed IDEs to pick up the new MCP server.")
 	}
 
 	if failed || skillFailed {

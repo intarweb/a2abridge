@@ -23,11 +23,12 @@ func init() {
 // keep this as a sub-action even though there's only one — a future
 // `cert verify` / `cert rotate` will slot in cleanly.
 func RunCert(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+	if len(args) == 0 {
+		printCertUsage(stderr)
+		return 2
+	}
+	if args[0] == "-h" || args[0] == "--help" {
 		printCertUsage(stdout)
-		if len(args) == 0 {
-			return 2
-		}
 		return 0
 	}
 	switch args[0] {

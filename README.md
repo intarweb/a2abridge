@@ -52,13 +52,13 @@ In August 2025 [IBM's ACP merged into Google's A2A](https://lfaidata.foundation/
 | **Cross-platform install** | macOS / Linux / Windows / WSL2 (one cmd) | macOS-leaning (tmux) | install.sh + install.ps1 | Python | npm |
 | **Lifecycle** | Per-agent bridge dies with MCP stdio session — no orphans | Lead-managed | Daemon `ccbd` per project | Single shared server | Distributed |
 | **MCP stdio for IDE** | Yes (any MCP client) | N/A (native) | Yes (delegation registry) | Yes (Claude Desktop) | Yes |
-| **Production state** | v0.x (this rewrite) | Experimental flag | v6.x | v1.x | v0.5+ |
+| **Production state** | v3.x | Experimental flag | v6.x | v1.x | v0.5+ |
 
 `a2abridge` is **not** trying to be ruflo (we are not building a 100-agent federated swarm) and **not** Agent Teams (we are not a built-in Claude feature). The niche is exactly: "cross-vendor, open-protocol, single-laptop mesh that any new A2A agent can drop into."
 
 ## What you get
 
-1. **Each running agent is an A2A peer.** Agent Card on `/.well-known/a2a`, full JSON-RPC 2.0 binding (`SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, `GetExtendedAgentCard`), TaskState/Message/Part/Artifact, error codes per spec §8, header `A2A-Version: 1.0`.
+1. **Each running agent is an A2A peer.** Agent Card on `/.well-known/agent-card.json`, full JSON-RPC 2.0 binding (`message/send`, `message/stream`, `tasks/get`, `tasks/list`, `tasks/cancel`, `tasks/resubscribe`, `tasks/pushNotificationConfig/*`, `agent/getAuthenticatedExtendedCard`), TaskState/Message/Part/Artifact, error codes per spec §8, header `A2A-Version: 1.0`.
 2. **Local directory** for zero-config discovery on your machine. Run as a system service (launchd / systemd-user / Windows Service) — same UX on every OS.
 3. **MCP tools** plugged into your IDE: `a2a_whoami`, `a2a_list_agents`, `a2a_send_message`, `a2a_send_streaming`, `a2a_get_task`, `a2a_cancel_task`, `a2a_inbox`, `a2a_complete_task`.
 4. **One-line install** that detects every supported IDE on your machine and registers the MCP server with `.bak` backups of your configs.
@@ -142,10 +142,10 @@ iwr -useb https://raw.githubusercontent.com/<owner>/a2abridge/main/install.ps1 |
 
 ### What the installer does
 
-1. Downloads the right binary from GitHub Releases for your `os/arch`.
+1. Downloads the right binary from GitHub Releases for your `os/arch` and verifies its SHA256 against the release's `checksums.txt` before installing.
 2. Drops it into `~/.a2abridge/bin/a2abridge` and `chmod +x`.
 3. Detects installed IDEs and writes the MCP block to each one's config — with timestamped `.bak` next to the original:
-   - Claude Code → `~/.claude/settings.json` (or `~/.claude.json` if present)
+   - Claude Code → `~/.claude.json` (hooks stay in `~/.claude/settings.json`)
    - Codex CLI → `~/.codex/config.toml`
    - Cline (VS Code) → `~/.config/Code/User/settings.json` (`cline.mcpServers`)
    - Continue → `~/.continue/config.json`
@@ -222,7 +222,7 @@ curl http://127.0.0.1:7777/agents | jq .
 # → list of registered peers and their URLs
 
 PEER_URL=$(curl -s http://127.0.0.1:7777/agents | jq -r '.[0].url')
-curl "$PEER_URL/.well-known/a2a" | jq .
+curl "$PEER_URL/.well-known/agent-card.json" | jq .
 # → that peer's Agent Card
 ```
 
@@ -235,7 +235,9 @@ The `a2abridge install` step writes the right MCP block into each
 detected IDE's config. This section explains what that block looks like
 per IDE so you can verify by hand or wire it up manually.
 
-### Claude Code (`~/.claude/settings.json`)
+### Claude Code (`~/.claude.json` + `~/.claude/settings.json`)
+
+The MCP server registration goes into `~/.claude.json`:
 
 ```json
 {
@@ -251,7 +253,14 @@ per IDE so you can verify by hand or wire it up manually.
         "A2A_SKILLS": "go,php,vue,refactor,review"
       }
     }
-  },
+  }
+}
+```
+
+The hook block stays in `~/.claude/settings.json`:
+
+```json
+{
   "hooks": {
     "UserPromptSubmit": [{
       "matcher": "*",
@@ -354,7 +363,7 @@ go build -o ~/.a2abridge/bin/a2abridge ./cmd/a2abridge
 
 - One binary, multiple subcommands. `a2abridge directory` runs as a daemon. `a2abridge bridge` is launched as MCP stdio server by your IDE — its lifecycle equals your IDE session.
 - Per-agent state lives in `./.a2a/` inside your current working directory (inbox, label, logs). Out-of-cwd state lives under `~/.a2abridge/`.
-- All loopback by default. Cross-machine federation lands in Phase 2 (mTLS + ed25519, opt-in).
+- All loopback by default. Cross-machine federation is opt-in (mTLS + ed25519) — see [Security model](#security-model).
 
 ## Subcommands
 
@@ -365,7 +374,7 @@ go build -o ~/.a2abridge/bin/a2abridge ./cmd/a2abridge
 | `a2abridge bridge` | Run as MCP stdio server (used by IDEs, do not call manually) |
 | `a2abridge service {install\|start\|stop\|restart\|status\|uninstall}` | Manage the directory daemon under launchd / systemd-user / Windows Service |
 | `a2abridge doctor` | Health check: directory ping, ports, IDE configs, skill, hook, version |
-| `a2abridge update [--check]` | Self-update from the latest GitHub release with rollback on failure |
+| `a2abridge update [--check]` | Self-update from the latest GitHub release (SHA256-verified against `checksums.txt`) with rollback on failure |
 | `a2abridge uninstall [--purge] [--keep-service]` | Remove the MCP block from every IDE config, skill, hook, and service (`.bak` unless `--purge`) |
 | `a2abridge cert generate [--cn <name>] [--dir <path>]` | Produce an ed25519 self-signed cert + key for federation |
 | `a2abridge completion {bash\|zsh\|fish\|powershell}` | Emit a tab-completion script for your shell |
@@ -376,12 +385,12 @@ go build -o ~/.a2abridge/bin/a2abridge ./cmd/a2abridge
 |---|---|---|
 | `a2a_whoami` | own Agent Card | "who am I to other agents" |
 | `a2a_list_agents` | `GET /agents` on directory | list peers + their cards |
-| `a2a_send_message` | `a2a.SendMessage` | fire-and-forget or blocking task |
-| `a2a_send_streaming` | `a2a.SendStreamingMessage` | wait for completion via SSE |
-| `a2a_get_task` | `a2a.GetTask` | poll a previously sent task |
-| `a2a_cancel_task` | `a2a.CancelTask` | cancel a running task |
+| `a2a_send_message` | `message/send` | fire-and-forget or blocking task |
+| `a2a_send_streaming` | `message/stream` | wait for completion via SSE |
+| `a2a_get_task` | `tasks/get` | poll a previously sent task |
+| `a2a_cancel_task` | `tasks/cancel` | cancel a running task |
 | `a2a_inbox` | local inbox | fetch unread incoming messages |
-| `a2a_complete_task` | `a2a.SendMessage` reply + state→COMPLETED | answer an incoming task |
+| `a2a_complete_task` | `message/send` reply + state→`completed` | answer an incoming task |
 
 ## Skill (Claude Code)
 
@@ -409,7 +418,7 @@ Set per-bridge environment in your IDE config (the installer fills sensible defa
 | `A2A_SKILLS` | unset | comma-separated capability tags |
 | `A2A_STATE_DIR` | `./.a2a` | per-project inbox/label/log directory |
 
-Cross-machine (Phase 2): `A2A_TLS_CERT`, `A2A_TLS_KEY`, `A2A_TRUST_ROOTS`, `A2A_PEER_ALLOW`.
+Cross-machine federation: `A2A_TLS_CERT`, `A2A_TLS_KEY`, `A2A_TRUST_ROOTS` (required once cert/key are set), `A2A_PEER_ALLOW`.
 
 ## How the inbox flow actually works
 
@@ -422,7 +431,7 @@ the model in 5 lines:
    from the human user — and prepends it to the system prompt.
 3. B answers the human. Within that turn (or the next) B can call
    `a2a_complete_task task_id=...` to reply to A.
-4. The reply lands as a `COMPLETED` Task on A's bridge. The bridge's
+4. The reply lands as a `completed` Task on A's bridge. The bridge's
    SSE subscriber sees it instantly (or, fallback, the 5-second poller).
 5. A gets a synthetic message in **its** inbox: "ОТВЕТ от B на твой
    вопрос «...»" — which prints on A's next prompt the same way.
@@ -466,7 +475,7 @@ Logs:
 
 | AI agent | MCP integration | Verified |
 |---|---|---|
-| Claude Code | `~/.claude/settings.json` | yes |
+| Claude Code | `~/.claude.json` (hooks in `~/.claude/settings.json`) | yes |
 | Codex CLI | `~/.codex/config.toml` | yes |
 | Cline (VS Code) | `cline.mcpServers` in VS Code settings | yes |
 | Continue | `~/.continue/config.json` | yes |
@@ -479,7 +488,8 @@ Logs:
 
 - **Loopback by default.** Directory and bridges bind `127.0.0.1`. Other users on the machine cannot see your peers.
 - **PII / secret screen** before `a2a_send_message`: 11 regex detectors (AWS access key, GitHub PAT, Anthropic / OpenAI / Google / Stripe / Slack tokens, JWT, PEM private keys, ...). Matches are replaced with `[REDACTED:<name>]` and surfaced in MCP metadata. The message still goes through with redacted text — the secret never leaves the bridge.
-- **mTLS + ed25519 federation** (opt-in cross-machine): set `A2A_TLS_CERT`, `A2A_TLS_KEY`, `A2A_TRUST_ROOTS`, `A2A_PEER_ALLOW` and the bridge serves over TLS 1.3 with required client certs and an allow-list match on peer CN/SAN. Keys are generated by `a2abridge cert generate`.
+- **mTLS + ed25519 federation** (opt-in cross-machine): set `A2A_TLS_CERT`, `A2A_TLS_KEY`, `A2A_TRUST_ROOTS`, `A2A_PEER_ALLOW` and the bridge serves over TLS 1.3 with required client certs and an allow-list match on peer CN/SAN. `A2A_TRUST_ROOTS` is mandatory once cert/key are set — the bridge refuses to start without it (no silent fallback to the system pool). Keys are generated by `a2abridge cert generate`.
+- **Verified releases.** Every GitHub release ships a `checksums.txt`; `a2abridge update` and the `install.sh` / `install.ps1` scripts verify the binary's SHA256 against it before swapping anything in.
 - **User hook scripts**: drop `~/.a2abridge/hooks/{on-inbound,on-outgoing-reply}.sh` (or `.ps1`/`.cmd` on Windows) and the bridge fires them on every inbound message and outbound reply (5-second timeout, JSON on stdin, fields in `A2A_EVENT_*` env vars).
 - **No telemetry.** Period.
 
@@ -493,11 +503,11 @@ Logs:
 - [x] `a2abridge doctor` — 9-check health audit
 - [x] Project-local `./.a2a/` state with `~/.a2abridge/state/<ppid>` fallback
 - [x] Skill `a2a-bridge` + UserPromptSubmit hook shipped via installer
-- [x] SSE fast-path for outbound replies (`a2a.SubscribeToTask`) with polling fallback
+- [x] SSE fast-path for outbound replies (`tasks/resubscribe`) with polling fallback
 - [x] PII / secret screen before send (11 regex detectors)
 - [x] User hook scripts on `on-inbound` / `on-outgoing-reply`
 - [x] Push Notifications per A2A 1.0 §9.5 (4 RPC methods + webhook delivery)
-- [x] HTTP+REST binding per A2A 1.0 §7.3
+- [x] HTTP+REST convenience API under `/v1/` (non-spec extension; the spec binding is JSON-RPC at `POST /`)
 - [x] mTLS + ed25519 federation (opt-in cross-machine)
 - [x] `a2abridge cert generate` for ed25519 self-signed cert/key
 - [x] Self-update + uninstall + shell completion
@@ -593,18 +603,20 @@ Conventional Commits, English subjects, no AI co-authors.
 
 `a2abridge` is implemented against [A2A Protocol Specification 1.0](https://a2a-protocol.org/latest/specification/):
 
-- Agent Card (§5) on `/.well-known/a2a`
-- JSON-RPC 2.0 binding (§7) — all eight methods
-- TaskState enum (§6.4): `SUBMITTED`, `WORKING`, `COMPLETED`, `FAILED`, `CANCELED`, `INPUT_REQUIRED`, `REJECTED`, `AUTH_REQUIRED`
-- Message / Part / Artifact (§6.1–6.6) with `ROLE_USER` / `ROLE_AGENT`
+- Agent Card (§5) on `/.well-known/agent-card.json`
+- JSON-RPC 2.0 binding (§7) at `POST /` with spec method names: `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`, `tasks/resubscribe`, `agent/getAuthenticatedExtendedCard`, plus `tasks/list` as a documented non-spec extension
+- TaskState enum (§6.4): `submitted`, `working`, `completed`, `failed`, `canceled`, `input-required`, `rejected`, `auth-required`
+- Message / Part / Artifact (§6.1–6.6) with roles `user` / `agent` and the spec Part union on the wire: `{"kind":"text","text":...}` / `{"kind":"file","file":{...}}` / `{"kind":"data","data":...}`
 - Stream one-of: `task | message | statusUpdate | artifactUpdate`
 - Error codes from §8 (`-32001 TaskNotFound`, `-32003 PushNotificationNotSupported`, `-32004 UnsupportedOperation`, ...)
 - Header `A2A-Version: 1.0`
-- Push Notifications (§9.5) — `CreateTaskPushNotificationConfig`, `Get`, `List`, `Delete` plus webhook delivery on every state change
-- HTTP+REST binding (§7.3) mirroring all RPC verbs at `/v1/...`
+- Push Notifications (§9.5) — `tasks/pushNotificationConfig/set`, `get`, `list`, `delete` plus webhook delivery on every state change
+- HTTP+REST convenience API mirroring all RPC verbs at `/v1/...` (non-spec extension — the spec-defined binding is JSON-RPC at `POST /`)
 - mTLS server/client auth with ed25519 cert generation
 
-Not yet implemented (v1.1+): gRPC binding (§7.2), cross-machine directory discovery via mDNS, retry policy for push delivery.
+**Upgrading from pre-3.0:** the legacy proto-style method names (`a2a.SendMessage`, `a2a.GetTask`, ...) are still accepted by the server as deprecated aliases, and the old Agent Card path `/.well-known/a2a` is still served as an alias of `/.well-known/agent-card.json` — but new clients should use the spec names and path only.
+
+Not yet implemented: gRPC binding (§7.2).
 
 ## Support the project
 

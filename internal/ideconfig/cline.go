@@ -30,54 +30,23 @@ func (clineWriter) Detect() string {
 }
 
 func (w clineWriter) Write(spec Spec, dryRun bool) Result {
-	res := Result{IDE: w.Name(), DryRun: dryRun}
 	path := w.Detect()
 	if path == "" {
-		res.Error = fmt.Errorf("VS Code globalStorage not found")
-		return res
+		return Result{IDE: w.Name(), DryRun: dryRun,
+			Error: fmt.Errorf("VS Code globalStorage not found: %w", ErrIDENotInstalled)}
 	}
-	res.Path = path
-	res.Found = fileExists(path)
 
 	// Cline only makes sense if the user has VS Code installed at all. If
 	// the parent globalStorage directory is missing, treat as not-installed
 	// and exit cleanly without creating a stale tree.
-	if !res.Found && !vsCodeInstalled() {
-		res.Error = fmt.Errorf("VS Code not detected — skipping")
-		return res
+	if !fileExists(path) && !vsCodeInstalled() {
+		return Result{IDE: w.Name(), Path: path, DryRun: dryRun,
+			Error: fmt.Errorf("VS Code not detected — skipping: %w", ErrIDENotInstalled)}
 	}
 
-	root, err := readJSONObject(path)
-	if err != nil {
-		res.Error = err
-		return res
-	}
-	servers := ensureNestedMap(root, "mcpServers")
-	desired := mcpEntryJSON(spec)
-	if equalJSON(servers[spec.Key], desired) {
-		res.Skipped = true
-		return res
-	}
-	servers[spec.Key] = desired
-
-	if dryRun {
-		res.Updated = true
-		return res
-	}
-	if res.Found {
-		bak, berr := backupFile(path)
-		if berr != nil {
-			res.Error = fmt.Errorf("backup: %w", berr)
-			return res
-		}
-		res.Backup = bak
-	}
-	if err := writeJSONObject(path, root); err != nil {
-		res.Error = err
-		return res
-	}
-	res.Updated = true
-	return res
+	return writeJSONConfig(w.Name(), path, dryRun, func(root map[string]any) bool {
+		return setMCPServerEntry(root, spec)
+	})
 }
 
 // vsCodeGlobalStorage returns the path to <vs-code>/User/globalStorage on

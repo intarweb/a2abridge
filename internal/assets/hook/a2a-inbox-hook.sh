@@ -9,6 +9,11 @@
 
 set -euo pipefail
 
+# A hook must never break the user's prompt: if python3 is unavailable
+# (minimal containers, stripped distros) skip silently instead of
+# crashing under set -e.
+command -v python3 >/dev/null 2>&1 || exit 0
+
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 
 # Find a non-empty inbox file. The bridge writes

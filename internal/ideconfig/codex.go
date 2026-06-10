@@ -89,11 +89,7 @@ func (w codexWriter) Write(spec Spec, dryRun bool) Result {
 		res.Error = err
 		return res
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		res.Error = err
-		return res
-	}
-	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+	if err := writeFileAtomic(path, buf.Bytes(), newConfigMode); err != nil {
 		res.Error = err
 		return res
 	}

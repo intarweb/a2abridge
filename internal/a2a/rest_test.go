@@ -2,6 +2,7 @@ package a2a
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -120,5 +121,42 @@ func TestRESTSendMessageBadJSONIs400(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestRESTCancelNotCancelableIs409(t *testing.T) {
+	ts := newTestServer(t, &fakeHandler{cancelErr: ErrTaskNotCancelable})
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/tasks/t1/cancel", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status = %d, want 409", resp.StatusCode)
+	}
+}
+
+// TestRESTStreamPreErrorIsPlainHTTPError verifies that a stream handler
+// failing before the first event yields a regular HTTP error response,
+// not a silently-empty SSE stream.
+func TestRESTStreamPreErrorIsPlainHTTPError(t *testing.T) {
+	h := &fakeHandler{
+		subscribe: func(_ context.Context, _ string, _ chan<- StreamResponse) error {
+			return ErrTaskNotFound
+		},
+	}
+	ts := newTestServer(t, h)
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/v1/tasks/missing/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
 }

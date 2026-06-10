@@ -4,7 +4,7 @@ package buildinfo
 // Version is the released semver. Overridable at link time:
 //
 //	go build -ldflags "-X github.com/vbcherepanov/a2abridge/internal/buildinfo.Version=1.2.3"
-var Version = "0.2.0-dev"
+var Version = "3.0.0-dev"
 
 // Commit is set at link time to the short git SHA of the build.
 var Commit = "unknown"

@@ -2,6 +2,7 @@ package ideconfig
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -127,7 +128,26 @@ func removeCodexEntry(path string) error {
 	if err := toml.NewEncoder(&buf).Encode(root); err != nil {
 		return err
 	}
-	return os.WriteFile(path, buf.Bytes(), 0o644)
+	return writeFileAtomic(path, buf.Bytes(), newConfigMode)
+}
+
+// removeClaudeEntries cleans both Claude Code files: mcpServers.a2a in
+// ~/.claude.json plus the UserPromptSubmit hook and any legacy
+// mcpServers.a2a left in ~/.claude/settings.json by older a2abridge
+// versions. Each file gets its own backup before modification.
+func removeClaudeEntries() error {
+	var errs []error
+	if p := claudeMCPConfigPath(); p != "" {
+		if err := removeJSONMCPEntry(p); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", p, err))
+		}
+	}
+	if p := claudeSettingsPath(); p != "" {
+		if err := removeJSONMCPEntry(p); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", p, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // removeContinueFile deletes the dedicated a2a.yaml the installer wrote.

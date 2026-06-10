@@ -1,6 +1,7 @@
 package security
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -79,6 +80,81 @@ func TestScreenCommonSecretShapes(t *testing.T) {
 				t.Errorf("Screen returned input unchanged when secrets present: %q", out)
 			}
 		})
+	}
+}
+
+// TestScreenRedactsWholePrivateKeyBlock guards the critical regression:
+// the screener must remove the entire PEM block (header + base64 body +
+// footer), not just the BEGIN marker — otherwise the key material itself
+// would be sent to the peer with the marker that downstream scanners look
+// for stripped away.
+func TestScreenRedactsWholePrivateKeyBlock(t *testing.T) {
+	const body1 = "MC4CAQAwBQYDK2VwBCIEIFakeFakeFakeFakeFakeFakeFakeFakeFakeFa"
+	const body2 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQfakefakef"
+
+	in := "key follows:\n" +
+		"-----BEGIN OPENSSH PRIVATE KEY-----\n" + body1 + "\n-----END OPENSSH PRIVATE KEY-----\n" +
+		"and another:\n" +
+		"-----BEGIN RSA PRIVATE KEY-----\n" + body2 + "\n-----END RSA PRIVATE KEY-----\n" +
+		"trailing text survives"
+
+	out, ms := Screen(in)
+	if len(ms) != 2 {
+		t.Fatalf("expected 2 private-key matches, got %d: %v", len(ms), ms)
+	}
+	for _, body := range []string{body1, body2} {
+		if strings.Contains(out, body) {
+			t.Errorf("base64 key body leaked into output: %q", out)
+		}
+	}
+	if strings.Contains(out, "BEGIN") || strings.Contains(out, "END") {
+		t.Errorf("PEM markers leaked into output: %q", out)
+	}
+	if !strings.Contains(out, "trailing text survives") {
+		t.Errorf("text after a complete block must survive, got: %q", out)
+	}
+}
+
+// TestScreenRedactsUnterminatedPrivateKey covers the fallback: a BEGIN
+// marker with no matching END (truncated paste) must be redacted from
+// the marker to the end of the text — never forwarded.
+func TestScreenRedactsUnterminatedPrivateKey(t *testing.T) {
+	const body = "MC4CAQAwBQYDK2VwBCIEIFakeFakeFakeFakeFakeFakeFakeFakeFakeFa"
+	in := "context before is fine\n-----BEGIN EC PRIVATE KEY-----\n" + body + "\nno end marker here"
+
+	out, ms := Screen(in)
+	if len(ms) == 0 {
+		t.Fatal("expected a private-key match on unterminated block")
+	}
+	if strings.Contains(out, body) {
+		t.Errorf("base64 key body leaked into output: %q", out)
+	}
+	if strings.Contains(out, "BEGIN") {
+		t.Errorf("BEGIN marker leaked into output: %q", out)
+	}
+	if !strings.Contains(out, "context before is fine") {
+		t.Errorf("text before the marker must survive, got: %q", out)
+	}
+	if !strings.Contains(out, "[REDACTED:private-key]") {
+		t.Errorf("missing redaction placeholder in output: %q", out)
+	}
+}
+
+// TestMatchValueIsShortPreview ensures Match.Value can't leak a usable
+// chunk of a secret: at most the first 4 chars + total length.
+func TestMatchValueIsShortPreview(t *testing.T) {
+	secret := "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	_, ms := Screen("token=" + secret)
+	if len(ms) != 1 {
+		t.Fatalf("expected 1 match, got %v", ms)
+	}
+	want := fmt.Sprintf("%s... (%d chars)", secret[:4], len(secret))
+	if ms[0].Value != want {
+		t.Errorf("Match.Value = %q, want %q", ms[0].Value, want)
+	}
+	// Defense in depth: never more than the 4-char prefix of the secret.
+	if strings.Contains(ms[0].Value, secret[:5]) {
+		t.Errorf("Match.Value leaks more than 4 chars of the secret: %q", ms[0].Value)
 	}
 }
 

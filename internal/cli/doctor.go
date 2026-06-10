@@ -55,12 +55,9 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	results := []checkResult{}
-	results = append(results, checkBinary())
-	results = append(results, checkDirectoryReachable(*directoryURL))
+	results := []checkResult{checkBinary(), checkDirectoryReachable(*directoryURL)}
 	results = append(results, checkIDEs()...)
-	results = append(results, checkSkill())
-	results = append(results, checkHook())
+	results = append(results, checkSkill(), checkHook())
 
 	worst := printResults(stdout, results)
 
@@ -87,7 +84,7 @@ func checkBinary() checkResult {
 func checkDirectoryReachable(url string) checkResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(url, "/")+"/agents", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(url, "/")+"/agents", http.NoBody)
 	if err != nil {
 		return checkResult{Name: "directory", Status: "FAIL", Detail: err.Error()}
 	}
@@ -132,7 +129,7 @@ func checkIDEs() []checkResult {
 		}
 		res := w.Write(spec, true) // dry-run
 		switch {
-		case res.Error != nil && strings.Contains(res.Error.Error(), "VS Code not detected"):
+		case res.Error != nil && errors.Is(res.Error, ideconfig.ErrIDENotInstalled):
 			out = append(out, checkResult{
 				Name:   "ide:" + w.Name(),
 				Status: "WARN",

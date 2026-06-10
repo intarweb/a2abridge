@@ -30,10 +30,10 @@ func DetectNudgeMode() string {
 // Nudger programmatically types text into the parent interactive session's
 // terminal tab so that an incoming A2A message creates a new turn in the
 // live Claude/Codex process without requiring the user to type.
-// Current backend: macOS Terminal.app via osascript. iTerm2 and tmux can be
-// added later.
+// Backends: tmux (preferred when available) and macOS Terminal.app via
+// osascript.
 type Nudger struct {
-	Mode string // "terminal" | "iterm2" | "tmux" | ""
+	Mode string // "terminal" | "tmux" | ""
 	TTY  string // e.g. "/dev/ttys003"
 	Log  *slog.Logger
 
@@ -77,8 +77,6 @@ func (n *Nudger) nudge(text string) error {
 	switch n.Mode {
 	case "terminal":
 		return n.nudgeTerminal(text)
-	case "iterm2":
-		return n.nudgeITerm2(text)
 	case "tmux":
 		return n.nudgeTmux(text)
 	default:
@@ -94,8 +92,13 @@ func (n *Nudger) nudge(text string) error {
 // this — `do script` sends \n via shell stdin which the TUI doesn't treat
 // as submit). tmux backend is preferred when available.
 func (n *Nudger) nudgeTerminal(text string) error {
+	// Escape AppleScript string metacharacters and flatten newlines —
+	// a raw \n/\r inside `keystroke "..."` would break the script (and a
+	// premature Return would submit a half-typed directive).
 	esc := strings.ReplaceAll(text, `\`, `\\`)
 	esc = strings.ReplaceAll(esc, `"`, `\"`)
+	esc = strings.ReplaceAll(esc, "\r", " ")
+	esc = strings.ReplaceAll(esc, "\n", " ")
 
 	script := fmt.Sprintf(`set targetWin to missing value
 set targetTab to missing value
@@ -156,11 +159,6 @@ return "ok"`, n.TTY, esc)
 		return fmt.Errorf("target tab not found for tty=%s (output=%q)", n.TTY, out.String())
 	}
 	return nil
-}
-
-// nudgeITerm2 — TODO (iTerm2 has a richer Python/AppleScript API).
-func (n *Nudger) nudgeITerm2(text string) error {
-	return fmt.Errorf("iterm2 backend not implemented yet")
 }
 
 // nudgeTmux: tmux send-keys -t <target> "<text>" Enter.

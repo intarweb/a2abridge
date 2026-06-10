@@ -38,8 +38,15 @@ func NewResponder(mode string, card a2a.AgentCard, store *Store, log *slog.Logge
 	if err != nil {
 		return nil, err
 	}
-	_, _ = f.WriteString(`{"mcpServers":{}}`)
-	_ = f.Close()
+	if _, err := f.WriteString(`{"mcpServers":{}}`); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return nil, fmt.Errorf("write empty MCP config: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return nil, fmt.Errorf("close empty MCP config: %w", err)
+	}
 	r.emptyMCP = f.Name()
 
 	// CODEX_HOME: скопируем auth.json из оригинала (чтобы авторизация работала),
@@ -51,15 +58,23 @@ func NewResponder(mode string, card a2a.AgentCard, store *Store, log *slog.Logge
 		return nil, err
 	}
 	origHome := filepath.Join(os.Getenv("HOME"), ".codex")
-	if b, err := os.ReadFile(filepath.Join(origHome, "auth.json")); err == nil {
-		_ = os.WriteFile(filepath.Join(home, "auth.json"), b, 0600)
+	if b, rerr := os.ReadFile(filepath.Join(origHome, "auth.json")); rerr == nil {
+		if werr := os.WriteFile(filepath.Join(home, "auth.json"), b, 0o600); werr != nil {
+			log.Warn("responder: auth.json copy failed, spawned codex may be unauthenticated", "err", werr)
+		}
+	} else if !os.IsNotExist(rerr) {
+		log.Warn("responder: auth.json read failed, spawned codex may be unauthenticated", "err", rerr)
 	}
-	_ = os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
+	if werr := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`
 model_reasoning_effort = "low"
 approval_policy = "never"
 sandbox_mode = "read-only"
-`), 0644)
-	_ = os.WriteFile(filepath.Join(home, "AGENTS.md"), []byte("# headless responder — no special rules\n"), 0644)
+`), 0o600); werr != nil {
+		log.Warn("responder: config.toml write failed", "err", werr)
+	}
+	if werr := os.WriteFile(filepath.Join(home, "AGENTS.md"), []byte("# headless responder — no special rules\n"), 0o600); werr != nil {
+		log.Warn("responder: AGENTS.md write failed", "err", werr)
+	}
 	r.codexHome = home
 	return r, nil
 }
@@ -74,10 +89,30 @@ func (r *Responder) Close() {
 	}
 }
 
+// isSyntheticReply reports whether msg is a synthetic outgoing-reply the
+// store injected for our own outbound task (or any other agent-authored
+// message). The responder must never answer those: spawning a headless
+// LLM run on a peer's answer burns money, produces an echo conversation
+// and then fails CompleteTask because the task lives on the peer's side.
+func isSyntheticReply(msg *a2a.Message) bool {
+	if msg.Role == a2a.RoleAgent {
+		return true
+	}
+	if msg.Metadata != nil {
+		if kind, ok := msg.Metadata["kind"].(string); ok && kind == "outgoing-reply" {
+			return true
+		}
+	}
+	return false
+}
+
 // Handle processes a single incoming message asynchronously.
 // Intended to be launched from Store.SendMessage via `go r.Handle(...)`.
 func (r *Responder) Handle(msg a2a.Message) {
 	if r.Mode == "" {
+		return
+	}
+	if isSyntheticReply(&msg) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), r.Timeout)
@@ -106,6 +141,11 @@ func (r *Responder) Handle(msg a2a.Message) {
 	reply, err := r.run(ctx, prompt)
 	if err != nil {
 		r.Log.Warn("responder failed", "err", err, "task", msg.TaskID)
+		FireHook("on-error", map[string]any{
+			"taskId": msg.TaskID,
+			"from":   from,
+			"error":  err.Error(),
+		})
 		return
 	}
 	reply = strings.TrimSpace(reply)
@@ -115,6 +155,11 @@ func (r *Responder) Handle(msg a2a.Message) {
 	}
 	if err := r.Store.CompleteTask(msg.TaskID, reply); err != nil {
 		r.Log.Warn("responder complete failed", "err", err, "task", msg.TaskID)
+		FireHook("on-error", map[string]any{
+			"taskId": msg.TaskID,
+			"from":   from,
+			"error":  err.Error(),
+		})
 		return
 	}
 	r.Log.Info("responder answered", "task", msg.TaskID, "len", len(reply))
@@ -187,9 +232,12 @@ func (r *Responder) runCodex(ctx context.Context, prompt string) (string, error)
 	if codexBin == "" {
 		return "", fmt.Errorf("codex binary not found")
 	}
+	// "--" terminates flag parsing so a peer-controlled prompt starting
+	// with a dash can never be parsed as a codex flag.
 	cmd := exec.CommandContext(ctx, codexBin,
 		"exec",
 		"--skip-git-repo-check",
+		"--",
 		prompt,
 	)
 	cmd.Stdin = nil
@@ -256,11 +304,4 @@ func firstOnPath(candidates ...string) string {
 		}
 	}
 	return ""
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -18,6 +18,7 @@ func nopLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, 
 // suite remains hermetic (no port allocation, no goroutine cleanup).
 func TestRegistryHTTPRoundTrip(t *testing.T) {
 	reg := New(nopLogger())
+	defer reg.Close()
 	ts := httptest.NewServer(reg.Routes())
 	defer ts.Close()
 
@@ -73,8 +74,56 @@ func TestRegistryHTTPRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRegisterRejectsInvalidURLs — the registry hands URLs out to every
+// peer, so only absolute http(s) URLs may enter.
+func TestRegisterRejectsInvalidURLs(t *testing.T) {
+	reg := New(nopLogger())
+	defer reg.Close()
+	ts := httptest.NewServer(reg.Routes())
+	defer ts.Close()
+
+	post := func(path, body string) int {
+		resp, err := http.Post(ts.URL+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	for _, bad := range []string{
+		`{"url":"ftp://peer"}`,
+		`{"url":"javascript:alert(1)"}`,
+		`{"url":"not a url"}`,
+		`{"url":"/relative/path"}`,
+		`{"url":"http://"}`,
+	} {
+		if got := post("/register", bad); got != 400 {
+			t.Errorf("register %s status = %d, want 400", bad, got)
+		}
+		if got := post("/heartbeat", bad); got != 400 {
+			t.Errorf("heartbeat %s status = %d, want 400", bad, got)
+		}
+	}
+	if got := len(reg.List()); got != 0 {
+		t.Errorf("invalid URLs entered the registry: %d", got)
+	}
+	if got := post("/register", `{"url":"https://peer:8443"}`); got != 204 {
+		t.Errorf("valid https register status = %d, want 204", got)
+	}
+}
+
+// TestRegistryCloseIsIdempotent — Close must stop the gc goroutine and be
+// safe to call twice (deferred close paths often double up).
+func TestRegistryCloseIsIdempotent(t *testing.T) {
+	reg := New(nopLogger())
+	reg.Close()
+	reg.Close()
+}
+
 func TestRegistryListReturnsSnapshot(t *testing.T) {
 	reg := New(nopLogger())
+	defer reg.Close()
 	reg.Register("http://x")
 	reg.Register("http://y")
 	snap := reg.List()
@@ -89,6 +138,7 @@ func TestRegistryListReturnsSnapshot(t *testing.T) {
 // doctor` to detect a live directory.
 func TestHealthzReturnsOK(t *testing.T) {
 	reg := New(nopLogger())
+	defer reg.Close()
 	ts := httptest.NewServer(reg.Routes())
 	defer ts.Close()
 	resp, err := http.Get(ts.URL + "/healthz")

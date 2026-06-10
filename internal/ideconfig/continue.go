@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -92,11 +93,7 @@ func (w continueWriter) Write(spec Spec, dryRun bool) Result {
 		}
 		res.Backup = bak
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		res.Error = err
-		return res
-	}
-	if err := os.WriteFile(path, []byte(desired), 0o644); err != nil {
+	if err := writeFileAtomic(path, []byte(desired), newConfigMode); err != nil {
 		res.Error = err
 		return res
 	}
@@ -140,21 +137,13 @@ func yamlScalar(s string) string {
 	return s
 }
 
+// sortedKeys returns m's keys in deterministic order so the rendered YAML
+// produces reproducible diffs.
 func sortedKeys(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
 	}
-	// std sort.Strings — deterministic order in YAML output for reproducible diffs.
-	sortStrings(out)
+	sort.Strings(out)
 	return out
-}
-
-// Local sort to avoid pulling sort just for this in tests; tiny insertion sort.
-func sortStrings(a []string) {
-	for i := 1; i < len(a); i++ {
-		for j := i; j > 0 && a[j-1] > a[j]; j-- {
-			a[j-1], a[j] = a[j], a[j-1]
-		}
-	}
 }

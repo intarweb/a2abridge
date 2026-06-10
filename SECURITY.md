@@ -38,6 +38,15 @@ Out of scope:
 - Anything dependent on the user disabling default loopback bind, mTLS,
   or the PII screen.
 
+## Operational notes
+
+The directory daemon exposes a Prometheus `/metrics` endpoint on the
+same listener as the A2A API. On the default loopback bind this is
+local-only; if you bind to `0.0.0.0` (e.g. Docker, federation), the
+endpoint becomes network-readable and leaks operational metadata (agent
+names, message counts, timing). Keep non-loopback deployments behind
+mTLS federation or a firewall, or scrape via a localhost-only sidecar.
+
 ## What counts as a vulnerability
 
 Examples we treat as security-class:

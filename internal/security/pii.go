@@ -11,16 +11,16 @@ import (
 )
 
 // Pattern is a labeled regex used by the PII screener. Adding a new
-// detector is a matter of appending to defaultPatterns().
+// detector is a matter of appending to defaultPatterns.
 type Pattern struct {
-	Name  string
-	Re    *regexp.Regexp
+	Name string
+	Re   *regexp.Regexp
 }
 
 // Match describes one redaction performed on the input.
 type Match struct {
 	Pattern string
-	Value   string // truncated value for diagnostics; never the full secret
+	Value   string // 4-char prefix + total length for diagnostics; never the full secret
 }
 
 // Screen scans s and returns:
@@ -33,14 +33,13 @@ func Screen(s string) (string, []Match) {
 	if s == "" {
 		return s, nil
 	}
-	patterns := defaultPatterns()
 	var matches []Match
 	out := s
-	for _, p := range patterns {
+	for _, p := range defaultPatterns {
 		out = p.Re.ReplaceAllStringFunc(out, func(hit string) string {
 			matches = append(matches, Match{
 				Pattern: p.Name,
-				Value:   truncate(hit, 12),
+				Value:   preview(hit),
 			})
 			return fmt.Sprintf("[REDACTED:%s]", p.Name)
 		})
@@ -48,22 +47,18 @@ func Screen(s string) (string, []Match) {
 	return out, matches
 }
 
-// HasSecrets is a fast no-allocate predicate — useful when the caller
-// only needs a yes/no answer (e.g. a doctor check).
-func HasSecrets(s string) bool {
-	for _, p := range defaultPatterns() {
-		if p.Re.MatchString(s) {
-			return true
-		}
-	}
-	return false
-}
-
-// defaultPatterns is the active screener set. Patterns are intentionally
-// scoped to high-value secrets that are uniquely shaped — generic strings
-// like "password" or "secret" are NOT screened because the false-positive
-// rate would dominate. Add new patterns conservatively and document why.
-func defaultPatterns() []Pattern {
+// defaultPatterns is the active screener set, compiled once at package
+// init. Patterns are intentionally scoped to high-value secrets that are
+// uniquely shaped — generic strings like "password" or "secret" are NOT
+// screened because the false-positive rate would dominate. Add new
+// patterns conservatively and document why.
+//
+// Order matters in two places:
+//   - "anthropic-key" before "openai-key" (prefix overlap);
+//   - the complete private-key block pattern before the unterminated
+//     fallback, so well-formed blocks are redacted precisely and only
+//     orphan BEGIN markers trigger the redact-to-end fallback.
+var defaultPatterns = func() []Pattern {
 	mp := func(name, expr string) Pattern {
 		return Pattern{Name: name, Re: regexp.MustCompile(expr)}
 	}
@@ -91,17 +86,27 @@ func defaultPatterns() []Pattern {
 		// JWT — three base64url segments separated by dots.
 		mp("jwt", `eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`),
 		// PEM-formatted private keys (any flavour: RSA, EC, OPENSSH, PGP).
-		mp("private-key", `-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED |PGP )?PRIVATE KEY-----`),
+		// The whole block — header, base64 body, footer — is redacted, not
+		// just the BEGIN marker.
+		mp("private-key", `(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`),
+		// Fallback: a BEGIN marker without a matching END (truncated paste)
+		// still carries the key body, so redact from the marker to the end
+		// of the text. Runs after the complete-block pattern above, so it
+		// only fires for unterminated blocks.
+		mp("private-key", `(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*`),
 	}
-}
+}()
 
-// truncate returns at most n chars of s with an ellipsis on overflow.
-// Used by Screen so diagnostic output never echoes the whole secret.
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+// preview renders a non-reversible diagnostic of a matched secret:
+// at most the first 4 characters plus the total length. Even if a Match
+// is accidentally logged, 4 chars of a key (usually its public prefix)
+// reveal nothing usable.
+func preview(s string) string {
+	const head = 4
+	if len(s) <= head {
+		return fmt.Sprintf("%s (%d chars)", s, len(s))
 	}
-	return strings.TrimSpace(s[:n]) + "..."
+	return fmt.Sprintf("%s... (%d chars)", s[:head], len(s))
 }
 
 // FormatMatches renders a list of matches in a single human line, useful

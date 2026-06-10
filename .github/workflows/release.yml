@@ -1,15 +1,17 @@
 name: release
 
 # Triggered on tags vX.Y.Z. Cross-compiles a2abridge for the supported
-# os/arch matrix, packs each artifact and attaches them to the GitHub
-# Release. install.sh / install.ps1 download those artifacts.
+# os/arch matrix, packs each artifact, then a single aggregating job
+# generates checksums.txt and attaches everything to the GitHub Release.
+# install.sh / install.ps1 and the CLI self-updater verify downloads
+# against checksums.txt.
 
 on:
   push:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -23,6 +25,7 @@ jobs:
           - { goos: linux,   goarch: amd64, ext: tar.gz }
           - { goos: linux,   goarch: arm64, ext: tar.gz }
           - { goos: windows, goarch: amd64, ext: zip    }
+          - { goos: windows, goarch: arm64, ext: zip    }
     env:
       GOOS:   ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
@@ -62,6 +65,33 @@ jobs:
           fi
           ls -la
 
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: dist/a2abridge_*
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/a2abridge_*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # checksums.txt format: "<sha256-hex>  <filename>" (two spaces) —
+      # the exact layout `sha256sum -c` and the installers expect.
+      - name: generate checksums.txt
+        run: |
+          cd dist
+          sha256sum a2abridge_* > checksums.txt
+          cat checksums.txt
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: |
+            dist/a2abridge_*
+            dist/checksums.txt

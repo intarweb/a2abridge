@@ -108,5 +108,8 @@ func printSubcommandHelp(name string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	// Subcommand prints its own -h via flag.FlagSet on the "-h" arg.
-	return cmd.Run([]string{"-h"}, stdout, stderr)
+	// Requested help is not an error, so the usage text must land on
+	// stdout — subcommands wire their flag.FlagSet output to the writer
+	// they receive as stderr, hence stdout is passed for both streams.
+	return cmd.Run([]string{"-h"}, stdout, stdout)
 }

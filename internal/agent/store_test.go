@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -387,5 +388,67 @@ func TestTrimToRuneSafe(t *testing.T) {
 	}
 	if short := trimTo("short", 10); short != "short" {
 		t.Errorf("trimTo(short) = %q", short)
+	}
+}
+
+// TestCompleteTaskClearsOutgoingReplyNotification: a synthetic outgoing-reply
+// (its TaskID is an outgoing task, absent from s.tasks) is cleared by
+// CompleteTask rather than returning ErrTaskNotFound, so it does not keep the
+// inbox snapshot non-empty. A second delivery of the same task is a no-op.
+func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
+	s := NewStore()
+	defer s.Close()
+	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")
+
+	// peer completes an outgoing task; the SSE fast-path renders the reply.
+	s.TrackOutgoing("out-1", "http://peer/", "peer-A", "What is 2+2?")
+	if !s.IngestOutgoingTerminal(&a2a.Task{
+		ID:     "out-1",
+		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
+	}) {
+		t.Fatal("IngestOutgoingTerminal should deliver the tracked reply")
+	}
+
+	// reply is in the inbox and the persisted snapshot.
+	if got := len(s.PeekInbox()); got != 1 {
+		t.Fatalf("inbox len after reply = %d, want 1", got)
+	}
+	before, err := os.ReadFile(s.InboxPath)
+	if err != nil {
+		t.Fatalf("read inbox file: %v", err)
+	}
+	if !strings.Contains(string(before), "out-1") {
+		t.Fatalf("inbox file should contain the outgoing-reply taskId; got %s", before)
+	}
+
+	// ack clears it (was ErrTaskNotFound).
+	if err := s.CompleteTask("out-1", ""); err != nil {
+		t.Fatalf("CompleteTask(outgoing-reply id) = %v, want nil", err)
+	}
+	if got := len(s.PeekInbox()); got != 0 {
+		t.Fatalf("inbox len after ack = %d, want 0 (reply not cleared)", got)
+	}
+	after, err := os.ReadFile(s.InboxPath)
+	if err != nil {
+		t.Fatalf("read inbox file: %v", err)
+	}
+	if strings.Contains(string(after), "out-1") {
+		t.Fatalf("inbox file still retains the outgoing-reply after ack: %s", after)
+	}
+
+	// second delivery is a no-op: pendingOutgoing was deleted on first delivery.
+	if s.IngestOutgoingTerminal(&a2a.Task{
+		ID:     "out-1",
+		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
+	}) {
+		t.Fatal("second IngestOutgoingTerminal should be a no-op (already delivered)")
+	}
+	if got := len(s.PeekInbox()); got != 0 {
+		t.Fatalf("inbox len after second ingest = %d, want 0 (reply re-appended)", got)
+	}
+
+	// unknown id with no inbox entry still reports not-found.
+	if err := s.CompleteTask("never-seen", ""); !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Fatalf("CompleteTask(unknown id) = %v, want ErrTaskNotFound", err)
 	}
 }

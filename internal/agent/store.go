@@ -574,19 +574,32 @@ func (s *Store) PeekInbox() []a2a.Message {
 func (s *Store) CompleteTask(taskID, replyText string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Drop inbox entries for this task before the s.tasks lookup. A synthetic
+	// outgoing-reply carries an outgoing task id that is absent from s.tasks,
+	// so the earlier ErrTaskNotFound return skipped this drop and the entry
+	// lingered in the inbox snapshot.
+	filtered := s.inbox[:0]
+	dropped := false
+	for _, m := range s.inbox {
+		if m.TaskID == taskID {
+			dropped = true
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	if dropped {
+		s.inbox = filtered
+		s.persistInboxLocked()
+	}
+
 	t, ok := s.tasks[taskID]
 	if !ok {
+		if dropped {
+			// cleared a synthetic outgoing-reply; nothing else to complete
+			return nil
+		}
 		return a2a.ErrTaskNotFound
 	}
-	// drop inbox entries for this task
-	filtered := s.inbox[:0]
-	for _, m := range s.inbox {
-		if m.TaskID != taskID {
-			filtered = append(filtered, m)
-		}
-	}
-	s.inbox = filtered
-	s.persistInboxLocked()
 	reply := a2a.Message{
 		MessageID: uuid.NewString(),
 		ContextID: t.ContextID,

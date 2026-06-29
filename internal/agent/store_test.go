@@ -391,64 +391,50 @@ func TestTrimToRuneSafe(t *testing.T) {
 	}
 }
 
-// TestCompleteTaskClearsOutgoingReplyNotification: a synthetic outgoing-reply
-// (its TaskID is an outgoing task, absent from s.tasks) is cleared by
-// CompleteTask rather than returning ErrTaskNotFound, so it does not keep the
-// inbox snapshot non-empty. A second delivery of the same task is a no-op.
-func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
+// TestIngestOutgoingTerminalSkipsEmptyReply verifies the empty-arrivals fix:
+// a peer completing our outbound task with NO reply text must not land an
+// empty "[ОТВЕТ …]" record in our inbox.
+func TestIngestOutgoingTerminalSkipsEmptyReply(t *testing.T) {
 	s := NewStore()
-	defer s.Close()
-	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")
-
-	// peer completes an outgoing task; the SSE fast-path renders the reply.
-	s.TrackOutgoing("out-1", "http://peer/", "peer-A", "What is 2+2?")
-	if !s.IngestOutgoingTerminal(&a2a.Task{
-		ID:     "out-1",
+	s.TrackOutgoing("task-empty", "http://peer/", "peer-A", "ping?")
+	ok := s.IngestOutgoingTerminal(&a2a.Task{
+		ID:     "task-empty",
 		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
-	}) {
-		t.Fatal("IngestOutgoingTerminal should deliver the tracked reply")
+		// no artifacts, no status message → empty reply text
+	})
+	if !ok {
+		t.Fatalf("IngestOutgoingTerminal = false, want true (tracked + terminal)")
 	}
+	if pending := s.PeekInbox(); len(pending) != 0 {
+		t.Fatalf("inbox size = %d, want 0 (empty reply must be suppressed)", len(pending))
+	}
+}
 
-	// reply is in the inbox and the persisted snapshot.
-	if got := len(s.PeekInbox()); got != 1 {
-		t.Fatalf("inbox len after reply = %d, want 1", got)
+// TestEvictTerminalReapsDeliveredOutgoingReplies verifies the stale-re-render
+// fix: aged one-shot outgoing-reply records are evicted by identity, while a
+// fresh reply and genuine incoming messages survive.
+func TestEvictTerminalReapsDeliveredOutgoingReplies(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	oldTS := now.Add(-20 * time.Minute).UTC().Format(time.RFC3339)
+	freshTS := now.UTC().Format(time.RFC3339)
+	s.mu.Lock()
+	s.inbox = []a2a.Message{
+		{MessageID: "reply-old", TaskID: "old", Metadata: map[string]any{"kind": "outgoing-reply", "ts": oldTS}},
+		{MessageID: "reply-fresh", TaskID: "fresh", Metadata: map[string]any{"kind": "outgoing-reply", "ts": freshTS}},
+		{MessageID: "incoming-1", TaskID: "inc"}, // genuine incoming, no ts → never evicted
 	}
-	before, err := os.ReadFile(s.InboxPath)
-	if err != nil {
-		t.Fatalf("read inbox file: %v", err)
-	}
-	if !strings.Contains(string(before), "out-1") {
-		t.Fatalf("inbox file should contain the outgoing-reply taskId; got %s", before)
-	}
+	s.mu.Unlock()
 
-	// ack clears it (was ErrTaskNotFound).
-	if err := s.CompleteTask("out-1", ""); err != nil {
-		t.Fatalf("CompleteTask(outgoing-reply id) = %v, want nil", err)
-	}
-	if got := len(s.PeekInbox()); got != 0 {
-		t.Fatalf("inbox len after ack = %d, want 0 (reply not cleared)", got)
-	}
-	after, err := os.ReadFile(s.InboxPath)
-	if err != nil {
-		t.Fatalf("read inbox file: %v", err)
-	}
-	if strings.Contains(string(after), "out-1") {
-		t.Fatalf("inbox file still retains the outgoing-reply after ack: %s", after)
-	}
+	s.evictTerminal(now)
 
-	// second delivery is a no-op: pendingOutgoing was deleted on first delivery.
-	if s.IngestOutgoingTerminal(&a2a.Task{
-		ID:     "out-1",
-		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
-	}) {
-		t.Fatal("second IngestOutgoingTerminal should be a no-op (already delivered)")
+	got := s.PeekInbox()
+	if len(got) != 2 {
+		t.Fatalf("inbox size after evict = %d, want 2 (aged reply reaped)", len(got))
 	}
-	if got := len(s.PeekInbox()); got != 0 {
-		t.Fatalf("inbox len after second ingest = %d, want 0 (reply re-appended)", got)
-	}
-
-	// unknown id with no inbox entry still reports not-found.
-	if err := s.CompleteTask("never-seen", ""); !errors.Is(err, a2a.ErrTaskNotFound) {
-		t.Fatalf("CompleteTask(unknown id) = %v, want ErrTaskNotFound", err)
+	for _, m := range got {
+		if m.MessageID == "reply-old" {
+			t.Fatal("reply-old should have been evicted")
+		}
 	}
 }

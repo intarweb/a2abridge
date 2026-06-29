@@ -401,10 +401,16 @@ func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
 	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")
 
 	// peer completes an outgoing task; the SSE fast-path renders the reply.
+	// Reply text must be non-empty: empty completions are suppressed (no inbox
+	// entry) by appendSyntheticReply, so a contentful reply is what exercises
+	// the CompleteTask clear-path this test covers.
 	s.TrackOutgoing("out-1", "http://peer/", "peer-A", "What is 2+2?")
 	if !s.IngestOutgoingTerminal(&a2a.Task{
-		ID:     "out-1",
-		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
+		ID: "out-1",
+		Status: a2a.TaskStatus{
+			State:   a2a.TaskStateCompleted,
+			Message: &a2a.Message{Parts: []a2a.Part{{Text: "4"}}},
+		},
 	}) {
 		t.Fatal("IngestOutgoingTerminal should deliver the tracked reply")
 	}
@@ -450,5 +456,53 @@ func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
 	// unknown id with no inbox entry still reports not-found.
 	if err := s.CompleteTask("never-seen", ""); !errors.Is(err, a2a.ErrTaskNotFound) {
 		t.Fatalf("CompleteTask(unknown id) = %v, want ErrTaskNotFound", err)
+	}
+}
+
+// TestIngestOutgoingTerminalSkipsEmptyReply verifies the empty-arrivals fix:
+// a peer completing our outbound task with NO reply text must not land an
+// empty "[ОТВЕТ …]" record in our inbox.
+func TestIngestOutgoingTerminalSkipsEmptyReply(t *testing.T) {
+	s := NewStore()
+	s.TrackOutgoing("task-empty", "http://peer/", "peer-A", "ping?")
+	ok := s.IngestOutgoingTerminal(&a2a.Task{
+		ID:     "task-empty",
+		Status: a2a.TaskStatus{State: a2a.TaskStateCompleted},
+		// no artifacts, no status message → empty reply text
+	})
+	if !ok {
+		t.Fatalf("IngestOutgoingTerminal = false, want true (tracked + terminal)")
+	}
+	if pending := s.PeekInbox(); len(pending) != 0 {
+		t.Fatalf("inbox size = %d, want 0 (empty reply must be suppressed)", len(pending))
+	}
+}
+
+// TestEvictTerminalReapsDeliveredOutgoingReplies verifies the stale-re-render
+// fix: aged one-shot outgoing-reply records are evicted by identity, while a
+// fresh reply and genuine incoming messages survive.
+func TestEvictTerminalReapsDeliveredOutgoingReplies(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	oldTS := now.Add(-20 * time.Minute).UTC().Format(time.RFC3339)
+	freshTS := now.UTC().Format(time.RFC3339)
+	s.mu.Lock()
+	s.inbox = []a2a.Message{
+		{MessageID: "reply-old", TaskID: "old", Metadata: map[string]any{"kind": "outgoing-reply", "ts": oldTS}},
+		{MessageID: "reply-fresh", TaskID: "fresh", Metadata: map[string]any{"kind": "outgoing-reply", "ts": freshTS}},
+		{MessageID: "incoming-1", TaskID: "inc"}, // genuine incoming, no ts → never evicted
+	}
+	s.mu.Unlock()
+
+	s.evictTerminal(now)
+
+	got := s.PeekInbox()
+	if len(got) != 2 {
+		t.Fatalf("inbox size after evict = %d, want 2 (aged reply reaped)", len(got))
+	}
+	for _, m := range got {
+		if m.MessageID == "reply-old" {
+			t.Fatal("reply-old should have been evicted")
+		}
 	}
 }

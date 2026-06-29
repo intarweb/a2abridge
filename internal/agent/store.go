@@ -143,6 +143,30 @@ func (s *Store) evictTerminal(now time.Time) int {
 			evicted = append(evicted, id)
 		}
 	}
+	// FIX(stale-re-render): outgoing-reply notifications (MessageID "reply-…") are
+	// one-shot — delivered in real-time via OnIncoming + injected by the wake hook.
+	// The bot never complete_task's its OWN outgoing task IDs, so CompleteTask's
+	// by-taskID drop never reaches them and they re-rendered on every wake. Evict
+	// by IDENTITY (MessageID prefix; `kind` is stripped on-disk) once past the
+	// delivery TTL.
+	if len(s.inbox) > 0 {
+		replyCutoff := now.Add(-10 * time.Minute)
+		kept := s.inbox[:0]
+		for _, m := range s.inbox {
+			if strings.HasPrefix(m.MessageID, "reply-") {
+				if ts, ok := m.Metadata["ts"].(string); ok {
+					if when, err := time.Parse(time.RFC3339, ts); err == nil && when.Before(replyCutoff) {
+						continue // delivered + aged out → drop
+					}
+				}
+			}
+			kept = append(kept, m)
+		}
+		if len(kept) != len(s.inbox) {
+			s.inbox = kept
+			s.persistInboxLocked()
+		}
+	}
 	s.mu.Unlock()
 	for _, id := range evicted {
 		// Empty PushConfigID = delete all webhooks for the task. The
@@ -229,12 +253,19 @@ func extractReplyText(t *a2a.Task) string {
 // poll loop and the SSE fast-path. Holds the lock for as little time as
 // possible and fires OnIncoming outside the critical section.
 func (s *Store) appendSyntheticReply(p *pendingOutgoingTask, reply, state string) {
+	// FIX(empty-arrivals): a contentless completion (peer completed with no reply
+	// text — e.g. a bare a2a_complete_task ack) used to land as an empty "[ОТВЕТ …]"
+	// record: noise that also fed the never-cleared stale floor. The terminal state
+	// is already recorded on the task; a contentless completion needs no inbox entry.
+	if strings.TrimSpace(reply) == "" {
+		return
+	}
 	synthetic := a2a.Message{
 		MessageID: "reply-" + p.TaskID,
 		TaskID:    p.TaskID,
 		Role:      a2a.RoleAgent,
 		Parts:     []a2a.Part{{Text: fmt.Sprintf("[ОТВЕТ от %s на твой вопрос «%s»]\n%s", p.PeerName, trimTo(p.Question, 80), reply)}},
-		Metadata:  map[string]any{"from": p.PeerName, "kind": "outgoing-reply", "state": state},
+		Metadata:  map[string]any{"from": p.PeerName, "kind": "outgoing-reply", "state": state, "ts": time.Now().UTC().Format(time.RFC3339)},
 	}
 	s.mu.Lock()
 	s.inbox = append(s.inbox, synthetic)

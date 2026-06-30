@@ -399,6 +399,10 @@ func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
 	s := NewStore()
 	defer s.Close()
 	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")
+	// PeekInbox now consumes one-shot outgoing-replies (the wake-spam fix), so this
+	// test reads s.inbox directly to verify the CompleteTask clear-path without the
+	// peek-consume side effect.
+	inboxLen := func() int { s.mu.Lock(); defer s.mu.Unlock(); return len(s.inbox) }
 
 	// peer completes an outgoing task; the SSE fast-path renders the reply.
 	// Reply text must be non-empty: empty completions are suppressed (no inbox
@@ -416,7 +420,7 @@ func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
 	}
 
 	// reply is in the inbox and the persisted snapshot.
-	if got := len(s.PeekInbox()); got != 1 {
+	if got := inboxLen(); got != 1 {
 		t.Fatalf("inbox len after reply = %d, want 1", got)
 	}
 	before, err := os.ReadFile(s.InboxPath)
@@ -431,7 +435,7 @@ func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
 	if err := s.CompleteTask("out-1", ""); err != nil {
 		t.Fatalf("CompleteTask(outgoing-reply id) = %v, want nil", err)
 	}
-	if got := len(s.PeekInbox()); got != 0 {
+	if got := inboxLen(); got != 0 {
 		t.Fatalf("inbox len after ack = %d, want 0 (reply not cleared)", got)
 	}
 	after, err := os.ReadFile(s.InboxPath)
@@ -449,7 +453,7 @@ func TestCompleteTaskClearsOutgoingReplyNotification(t *testing.T) {
 	}) {
 		t.Fatal("second IngestOutgoingTerminal should be a no-op (already delivered)")
 	}
-	if got := len(s.PeekInbox()); got != 0 {
+	if got := inboxLen(); got != 0 {
 		t.Fatalf("inbox len after second ingest = %d, want 0 (reply re-appended)", got)
 	}
 
@@ -504,5 +508,29 @@ func TestEvictTerminalReapsDeliveredOutgoingReplies(t *testing.T) {
 		if m.MessageID == "reply-old" {
 			t.Fatal("reply-old should have been evicted")
 		}
+	}
+}
+
+// TestPeekConsumesOutgoingReply verifies the wake-spam fix: PEEK returns an
+// outgoing-reply once then consumes it (so it stops re-surfacing every wake),
+// while genuine incoming task messages survive peek (stays non-destructive).
+func TestPeekConsumesOutgoingReply(t *testing.T) {
+	s := NewStore()
+	defer s.Close()
+	s.InboxPath = filepath.Join(t.TempDir(), "inbox.json")
+	s.mu.Lock()
+	s.inbox = []a2a.Message{
+		{MessageID: "incoming-1", TaskID: "t1", Parts: []a2a.Part{{Text: "hi"}}},
+		{MessageID: "reply-out1", TaskID: "out1", Parts: []a2a.Part{{Text: "done"}},
+			Metadata: map[string]any{"kind": "outgoing-reply"}},
+	}
+	s.mu.Unlock()
+
+	if first := s.PeekInbox(); len(first) != 2 {
+		t.Fatalf("first peek len=%d, want 2 (returns both once)", len(first))
+	}
+	second := s.PeekInbox()
+	if len(second) != 1 || second[0].MessageID != "incoming-1" {
+		t.Fatalf("second peek = %d msgs, want only incoming-1 (reply consumed)", len(second))
 	}
 }

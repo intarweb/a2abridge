@@ -150,7 +150,7 @@ func (s *Store) evictTerminal(now time.Time) int {
 	// by IDENTITY (MessageID prefix; `kind` is stripped on-disk) once past the
 	// delivery TTL.
 	if len(s.inbox) > 0 {
-		replyCutoff := now.Add(-10 * time.Minute)
+		replyCutoff := now.Add(-2 * time.Minute)
 		kept := s.inbox[:0]
 		for _, m := range s.inbox {
 			if strings.HasPrefix(m.MessageID, "reply-") {
@@ -597,6 +597,26 @@ func (s *Store) PeekInbox() []a2a.Message {
 	defer s.mu.Unlock()
 	out := make([]a2a.Message, len(s.inbox))
 	copy(out, s.inbox)
+	// FIX(wake-spam): outgoing-reply notifications (MessageID "reply-…") are
+	// one-shot. A bot that PEEKs (instead of draining) used to leave them in
+	// s.inbox, so they re-surfaced on every wake until the janitor TTL — the
+	// residual wake-spam. Consume them on read: the caller gets them in `out`
+	// this once, then they're gone (DrainInbox already clears all; this makes
+	// peek consume the one-shot replies too). Genuine incoming task messages
+	// are untouched, so peeking pending tasks stays non-destructive.
+	kept := s.inbox[:0]
+	dropped := false
+	for _, m := range s.inbox {
+		if strings.HasPrefix(m.MessageID, "reply-") {
+			dropped = true
+			continue
+		}
+		kept = append(kept, m)
+	}
+	if dropped {
+		s.inbox = kept
+		s.persistInboxLocked()
+	}
 	return out
 }
 
